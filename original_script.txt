@@ -9,7 +9,6 @@ from openpyxl import load_workbook
 from tqdm import tqdm
 from copy import copy
 from openpyxl.utils import range_boundaries
-import duckdb
 import time
 
 # ================================================================
@@ -27,6 +26,18 @@ SELECT_MEASURES_COL = "Select Measures"
 
 PROPOSED_SAP_COL = "Proposed Post SAP Score"
 PRE_SAP_COL      = "Pre SAP Score (Full SAP)"
+
+# ── Smartsheet column names for climate risk / property flags ──
+CONSERVATION_AREA_COL = "Conservation Area"
+LISTED_BUILDING_COL   = "Listed Building"
+RADON_RISK_COL        = "Radon Risk"
+FLOOD_RISK_COL        = "Flood Risk"
+SUBS_2030_COL         = "Subsidence 2030"
+SUBS_2070_COL         = "Subsidence 2070"
+WDR_RISK_COL          = "Wind Driven Rain Risk"
+RAINFALL_RISK_COL     = "Rainfall Risk"
+WIND_SPEED_RISK_COL   = "Wind speed Risk"
+WILDFIRE_RISK_COL     = "Wildfire Risk"
 
 SM_URL     = f"https://api.smartsheet.eu/2.0/sheets/{SHEET_ID}"
 SM_HEADERS = {"Authorization": f"Bearer {SS_TOKEN}"}
@@ -1211,6 +1222,17 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
             property_id_value = ""
             sap_potential     = ""
             sap_current       = ""
+            # ── No match → climate risk / flag values from Smartsheet are empty ──
+            conservation_flag = ""
+            listed_building   = ""
+            radon_risk        = ""
+            flood_risk        = ""
+            subs2030          = ""
+            subs2070          = ""
+            wdr_risk          = ""
+            rainfall_risk     = ""
+            wind_speed_risk   = ""
+            wildfire_risk     = ""
         else:
             print(f"✅ {prop_name} – ADDRESS MATCH")
             matched_address   = matched_row["Address"]
@@ -1218,6 +1240,19 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
             property_id_value = matched_row.get("Property ID", "")
             sap_potential     = matched_row.get(PROPOSED_SAP_COL, "")
             sap_current       = matched_row.get(PRE_SAP_COL, "")
+
+            # ── Pull climate-risk / property-flag values from Smartsheet ──
+            conservation_flag = matched_row.get(CONSERVATION_AREA_COL, "")
+            listed_building   = matched_row.get(LISTED_BUILDING_COL, "")
+            radon_risk        = matched_row.get(RADON_RISK_COL, "")
+            flood_risk_raw    = matched_row.get(FLOOD_RISK_COL, "")
+            flood_risk        = "No" if (flood_risk_raw is None or pd.isna(flood_risk_raw) or str(flood_risk_raw).strip() == "") else flood_risk_raw
+            subs2030          = matched_row.get(SUBS_2030_COL, "")
+            subs2070          = matched_row.get(SUBS_2070_COL, "")
+            wdr_risk          = matched_row.get(WDR_RISK_COL, "")
+            rainfall_risk     = matched_row.get(RAINFALL_RISK_COL, "")
+            wind_speed_risk   = matched_row.get(WIND_SPEED_RISK_COL, "")
+            wildfire_risk     = matched_row.get(WILDFIRE_RISK_COL, "")
 
         # ── Coordinates ───────────────────────────────────────────
         latitude, longitude = extract_lat_lon_from_cr(cr_pdf)
@@ -1271,80 +1306,6 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         property_constraints_val, property_construction_flag  = extract_constraints_and_construction_from_cr(cr_pdf)
         orientation_direction                                 = get_building_orientation_direction(cr_pdf)
 
-        # ── Geo risks via DuckDB ──────────────────────────────────
-        lon_f = float(longitude)
-        lat_f = float(latitude)
-
-        con = duckdb.connect(DUCKDB_FILE)
-        con.execute("INSTALL spatial;")
-        con.execute("LOAD spatial;")
-
-        query = f"""
-        WITH point AS (SELECT ST_Point({lon_f}, {lat_f}) AS geom),
-        la AS (SELECT * FROM la_districts WHERE ST_Contains(geom, (SELECT geom FROM point)))
-        SELECT
-            CASE WHEN EXISTS (
-                SELECT 1 FROM conservation WHERE ST_Contains(geom, (SELECT geom FROM point))
-            ) THEN 'Yes' ELSE 'No' END AS conservation,
-            (SELECT CASE CLASS_MAX
-                WHEN 1 THEN 'Very Low' WHEN 2 THEN 'Low' WHEN 3 THEN 'Moderate'
-                WHEN 4 THEN 'High' WHEN 5 THEN 'Very High' WHEN 6 THEN 'Extremely High'
-                ELSE 'Unknown' END
-             FROM radon WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS radon,
-            (SELECT "flood-risk-level"
-             FROM flood WHERE ST_Contains(geom, (SELECT geom FROM point))
-             ORDER BY "flood-risk-level" DESC LIMIT 1) AS flood,
-            (SELECT CLASS FROM subs2030 WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS subs2030,
-            (SELECT CLASS FROM subs2070 WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS subs2070,
-            (SELECT CASE
-                WHEN AVG_WDR_baseline_Median <= 100 THEN 'Very Low'
-                WHEN AVG_WDR_baseline_Median <= 200 THEN 'Low'
-                WHEN AVG_WDR_baseline_Median <= 300 THEN 'Moderate'
-                WHEN AVG_WDR_baseline_Median <= 400 THEN 'High'
-                WHEN AVG_WDR_baseline_Median <= 500 THEN 'Very High'
-                ELSE 'Extremely High' END
-             FROM wdr WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS wdr,
-            (SELECT CASE
-                WHEN avg_pr < 60  THEN 'Very Low'    WHEN avg_pr < 80  THEN 'Low'
-                WHEN avg_pr < 100 THEN 'Below Moderate' WHEN avg_pr < 120 THEN 'Moderate'
-                WHEN avg_pr < 140 THEN 'Above Moderate' WHEN avg_pr < 160 THEN 'High'
-                WHEN avg_pr < 180 THEN 'Very High'   WHEN avg_pr < 200 THEN 'Extremely High'
-                WHEN avg_pr < 240 THEN 'Severe'      ELSE 'Exceptional' END
-             FROM (
-                SELECT (prJan+prFeb+prMar+prApr+prMay+prJun+prJul+prAug+prSep+prOct+prNov+prDec)/12.0 AS avg_pr, geom
-                FROM rainfall
-             ) r WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS rainfall,
-            (SELECT CASE
-                WHEN avg_ws < 4  THEN 'Very Low' WHEN avg_ws < 6  THEN 'Low'
-                WHEN avg_ws < 8  THEN 'Moderate' WHEN avg_ws < 10 THEN 'High'
-                ELSE 'Very High' END
-             FROM (
-                SELECT (ws_winter_baseline_median+ws_spring_baseline_median+ws_summer_baseline_median+ws_autumn_baseline_median)/4.0 AS avg_ws, geom
-                FROM windspeed
-             ) w WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS wind,
-            (SELECT CASE
-                WHEN w."Wildfire incidents (number)" / w."Area (square kilometres)" < 1.18  THEN 'Low'
-                WHEN w."Wildfire incidents (number)" / w."Area (square kilometres)" < 4.88  THEN 'Moderate'
-                WHEN w."Wildfire incidents (number)" / w."Area (square kilometres)" < 13.5  THEN 'High'
-                ELSE 'Very High' END
-             FROM wildfire w JOIN la ON la."name" = w."Local authority district" LIMIT 1) AS wildfire,
-            (SELECT la."name" FROM la LIMIT 1) AS local_authority_name
-        """
-        result = con.execute(query).fetchdf().iloc[0].to_dict()
-        con.close()
-
-        conservation_flag    = result.get("conservation", "")
-        radon_risk           = result.get("radon", "")
-        flood_risk_raw       = result.get("flood")
-        flood_risk           = "No" if (flood_risk_raw is None or pd.isna(flood_risk_raw) or str(flood_risk_raw).strip() == "") else flood_risk_raw
-        subs2030             = result.get("subs2030", "")
-        subs2070             = result.get("subs2070", "")
-        wdr_risk             = result.get("wdr", "")
-        rainfall_risk        = result.get("rainfall", "")
-        wind_speed_risk      = result.get("wind", "")
-        wildfire_risk        = result.get("wildfire", "")
-        local_authority_name = result.get("local_authority_name", "")
-
         # ── Bedroom count ─────────────────────────────────────────
         highest_bedroom = extract_highest_bedroom_from_contents(read_pdf_page_lines(cr_pdf, 1))
 
@@ -1374,6 +1335,7 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
             "exposure_zone":              exposure_zone,
             "property_construction_flag": property_construction_flag,
             "conservation_flag":          conservation_flag,
+            "listed_building":            listed_building,
             "property_constraints_val":   property_constraints_val,
             "vulnerable_flag":            vulnerable_flag,
             "tfa_sqm":                    tfa.replace("m", "sqm") if tfa else "",
