@@ -9,214 +9,408 @@ import pandas as pd
 from openpyxl import load_workbook
 from copy import copy
 from openpyxl.utils import range_boundaries
-import duckdb
 import time
 import tempfile
 import io
+import base64
+from pathlib import Path
+
+# ================================================================
+# BRAND COLOURS (from Design Specifics logo)
+# ================================================================
+# Sage green:    #9CB5A8
+# Dark navy:     #1F3A5F   (primary brand)
+# Lavender blue: #8B95C9   (secondary accent)
+
+# ================================================================
+# SMARTSHEET COLUMN NAMES (climate risk / property flags)
+# ================================================================
+CONSERVATION_AREA_COL = "Conservation Area"
+LISTED_BUILDING_COL   = "Listed Building"
+RADON_RISK_COL        = "Radon Risk"
+FLOOD_RISK_COL        = "Flood Risk"
+SUBS_2030_COL         = "Subsidence 2030"
+SUBS_2070_COL         = "Subsidence 2070"
+WDR_RISK_COL          = "Wind Driven Rain Risk"
+RAINFALL_RISK_COL     = "Rainfall Risk"
+WIND_SPEED_RISK_COL   = "Wind speed Risk"
+WILDFIRE_RISK_COL     = "Wildfire Risk"
 
 # ================================================================
 # PAGE CONFIG
 # ================================================================
 st.set_page_config(
-    page_title="Retrofit Design Exporter",
+    page_title="Design Specifics · Retrofit Design Exporter",
     page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ================================================================
-# CUSTOM CSS — dark industrial aesthetic
+# LOAD LOGO
+# Expects: template/Design_Specifics_logo.png
+# ================================================================
+def _load_logo_b64():
+    candidates = [
+        Path(__file__).parent / "template" / "Design_Specifics_logo.png",
+        Path("template/Design_Specifics_logo.png"),
+    ]
+
+    for p in candidates:
+        try:
+            if p.exists():
+                return base64.b64encode(p.read_bytes()).decode()
+        except Exception:
+            continue
+
+    return None
+
+
+LOGO_B64 = _load_logo_b64()
+
+# ================================================================
+# BUILT-IN FILES / SECRETS
+# ================================================================
+# Recommended: keep the token in .streamlit/secrets.toml as:
+SMARTSHEET_API_TOKEN = "your_token_here"
+# If you do not want to use secrets, paste the token between the quotes below.
+def _get_smartsheet_token():
+    try:
+        token = st.secrets.get("SMARTSHEET_API_TOKEN", "")
+    except Exception:
+        token = ""
+    return str(token).strip()
+
+SMARTSHEET_API_TOKEN = _get_smartsheet_token()
+# SMARTSHEET_API_TOKEN = "PASTE_YOUR_TOKEN_HERE"  # Optional direct hardcode, not recommended for GitHub
+
+# Put your Excel template here: assets/DESIGN EXPORT TEMPLATE.xlsx
+BUILTIN_TEMPLATE_PATH = Path(__file__).parent / "template" / "DESIGN EXPORT TEMPLATE.xlsx"
+
+def load_builtin_template_bytes():
+    if not BUILTIN_TEMPLATE_PATH.exists():
+        raise FileNotFoundError(
+            f"Built-in Excel template not found: {BUILTIN_TEMPLATE_PATH}"
+        )
+    return BUILTIN_TEMPLATE_PATH.read_bytes()
+
+# ================================================================
+# CUSTOM CSS — clean, minimalist, brand colours
 # ================================================================
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=Inter:wght@300;400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
-    --bg: #0d0f12;
-    --surface: #141720;
-    --surface2: #1c2030;
-    --border: #2a2f3e;
-    --accent: #00e5a0;
-    --accent2: #3b82f6;
-    --warn: #f59e0b;
-    --danger: #ef4444;
-    --text: #e2e8f0;
-    --muted: #64748b;
+    /* Brand */
+    --brand-navy:    #1F3A5F;
+    --brand-navy-2:  #2D4F7C;
+    --brand-sage:    #9CB5A8;
+    --brand-sage-2:  #B8CDC2;
+    --brand-lav:     #8B95C9;
+    --brand-lav-2:   #A8B1D6;
+
+    /* Surfaces — light, soft, eye-friendly */
+    --bg:        #F5F6F1;       /* warm off-white */
+    --surface:   #FFFFFF;
+    --surface2:  #FAFBF8;
+    --border:    #E4E6DE;
+    --border2:   #D2D5CB;
+
+    /* Text */
+    --text:      #1F3A5F;       /* matches brand navy */
+    --text2:     #4A5A72;
+    --muted:     #7A8294;
+    --muted2:    #A0A6B3;
+
+    /* States */
+    --success:   #5B8F73;
+    --warn:      #C99A4A;
+    --danger:    #B85A5A;
 }
 
 html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
-    background-color: var(--bg);
-    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif !important;
+    background-color: var(--bg) !important;
+    color: var(--text) !important;
 }
 
-.stApp { background: var(--bg); }
+.stApp { background: var(--bg) !important; }
 
+/* Sidebar */
 section[data-testid="stSidebar"] {
     background: var(--surface) !important;
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--border) !important;
+}
+section[data-testid="stSidebar"] > div { padding-top: 1.5rem !important; }
+
+/* Headings */
+h1, h2, h3, h4 {
+    font-family: 'Inter', sans-serif !important;
+    color: var(--brand-navy) !important;
+    letter-spacing: -0.01em !important;
+    font-weight: 700 !important;
 }
 
-h1, h2, h3 {
-    font-family: 'Syne', sans-serif;
-    color: var(--text);
-    letter-spacing: -0.02em;
+/* Logo container */
+.logo-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.4rem 1.8rem;
+    margin-bottom: 1.2rem;
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
 }
-
-.hero-title {
-    font-family: 'Syne', sans-serif;
-    font-size: 2.8rem;
-    font-weight: 800;
-    background: linear-gradient(135deg, #00e5a0 0%, #3b82f6 60%, #a855f7 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    line-height: 1.1;
-    margin-bottom: 0.2rem;
+.logo-wrap img {
+    height: 64px;
+    width: auto;
+    object-fit: contain;
 }
-
-.hero-sub {
-    font-family: 'DM Mono', monospace;
+.logo-divider {
+    width: 1px;
+    height: 50px;
+    background: var(--border);
+}
+.logo-title {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: var(--brand-navy);
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+}
+.logo-subtitle {
     font-size: 0.85rem;
     color: var(--muted);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-bottom: 2rem;
+    margin-top: 2px;
+    font-weight: 400;
 }
 
+/* Cards */
 .card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 1.5rem;
-    margin-bottom: 1.2rem;
-    position: relative;
-    overflow: hidden;
-}
-
-.card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    padding: 1.4rem 1.5rem;
+    margin-bottom: 1.1rem;
+    box-shadow: 0 1px 3px rgba(31, 58, 95, 0.03);
 }
 
 .card-label {
-    font-family: 'DM Mono', monospace;
-    font-size: 0.7rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--accent);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--brand-navy);
     margin-bottom: 0.6rem;
 }
 
+.card-hint {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 1rem;
+    line-height: 1.5;
+}
+
+/* Badges */
 .badge {
     display: inline-block;
-    background: rgba(0,229,160,0.1);
-    border: 1px solid rgba(0,229,160,0.3);
-    color: var(--accent);
-    border-radius: 20px;
-    padding: 2px 10px;
-    font-size: 0.72rem;
-    font-family: 'DM Mono', monospace;
-    letter-spacing: 0.05em;
+    background: #EAF0EC;
+    border: 1px solid #C5D5CC;
+    color: var(--success);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    font-weight: 500;
 }
-
-.badge-blue {
-    background: rgba(59,130,246,0.1);
-    border-color: rgba(59,130,246,0.3);
-    color: var(--accent2);
+.badge-brand {
+    background: #EBEEF6;
+    border-color: #C9D0E5;
+    color: var(--brand-navy);
 }
-
+.badge-lav {
+    background: #EFF1FA;
+    border-color: #CFD4ED;
+    color: #6671B3;
+}
 .badge-warn {
-    background: rgba(245,158,11,0.1);
-    border-color: rgba(245,158,11,0.3);
+    background: #FAF1E1;
+    border-color: #E8D5A8;
     color: var(--warn);
 }
 
+/* Log box */
 .log-box {
-    background: #0a0c10;
+    background: #FAFBF8;
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 1rem 1.2rem;
-    font-family: 'DM Mono', monospace;
+    padding: 0.9rem 1.1rem;
+    font-family: 'JetBrains Mono', monospace;
     font-size: 0.78rem;
-    color: #94a3b8;
-    min-height: 120px;
-    max-height: 340px;
+    color: var(--text2);
+    min-height: 160px;
+    max-height: 380px;
     overflow-y: auto;
     line-height: 1.7;
 }
+.log-ok    { color: var(--success); }
+.log-warn  { color: var(--warn); }
+.log-err   { color: var(--danger); }
+.log-info  { color: var(--brand-navy-2); }
+.log-empty {
+    color: var(--muted2);
+    font-style: italic;
+    font-family: 'Inter', sans-serif;
+}
 
-.log-ok   { color: var(--accent); }
-.log-warn { color: var(--warn); }
-.log-err  { color: var(--danger); }
-.log-info { color: var(--accent2); }
-
+/* Primary button — brand navy */
 .stButton > button {
-    background: linear-gradient(135deg, #00e5a0, #3b82f6) !important;
-    color: #0d0f12 !important;
-    font-family: 'Syne', sans-serif !important;
-    font-weight: 700 !important;
-    font-size: 1rem !important;
-    border: none !important;
+    background: var(--brand-navy) !important;
+    color: #FFFFFF !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.95rem !important;
+    border: 1px solid var(--brand-navy) !important;
     border-radius: 8px !important;
-    padding: 0.65rem 2rem !important;
-    letter-spacing: 0.02em !important;
-    transition: all 0.2s !important;
+    padding: 0.65rem 1.5rem !important;
+    transition: all 0.15s ease !important;
     width: 100%;
+    box-shadow: 0 1px 2px rgba(31, 58, 95, 0.1);
+}
+.stButton > button:hover:not(:disabled) {
+    background: var(--brand-navy-2) !important;
+    border-color: var(--brand-navy-2) !important;
+    box-shadow: 0 4px 12px rgba(31, 58, 95, 0.18) !important;
+    transform: translateY(-1px);
+}
+.stButton > button:disabled {
+    background: #CFD3C9 !important;
+    border-color: #CFD3C9 !important;
+    color: #FFFFFF !important;
+    cursor: not-allowed !important;
+    box-shadow: none !important;
 }
 
-.stButton > button:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 8px 24px rgba(0,229,160,0.3) !important;
+/* Download buttons */
+[data-testid="stDownloadButton"] > button {
+    background: var(--surface) !important;
+    color: var(--brand-navy) !important;
+    border: 1.5px solid var(--brand-sage) !important;
+    font-weight: 600 !important;
+    box-shadow: none !important;
+}
+[data-testid="stDownloadButton"] > button:hover {
+    background: #EAF0EC !important;
+    border-color: var(--brand-navy) !important;
 }
 
-.dl-btn > button {
+/* File uploader */
+div[data-testid="stFileUploader"] {
+    background: var(--surface) !important;
+    border: 1.5px dashed var(--border2) !important;
+    border-radius: 8px !important;
+    padding: 0.4rem !important;
+    transition: border-color 0.15s !important;
+}
+div[data-testid="stFileUploader"]:hover {
+    border-color: var(--brand-sage) !important;
+}
+div[data-testid="stFileUploader"] section { background: transparent !important; }
+div[data-testid="stFileUploader"] section > button {
     background: var(--surface2) !important;
-    color: var(--text) !important;
+    color: var(--brand-navy) !important;
     border: 1px solid var(--border) !important;
-    font-family: 'DM Mono', monospace !important;
-    font-size: 0.85rem !important;
+    border-radius: 6px !important;
     font-weight: 500 !important;
 }
-
-div[data-testid="stFileUploader"] {
-    background: var(--surface2);
-    border: 1px dashed var(--border);
-    border-radius: 10px;
-    padding: 0.5rem;
+div[data-testid="stFileUploader"] section > button:hover {
+    border-color: var(--brand-navy) !important;
 }
 
+/* Inputs */
 .stTextInput > div > div > input,
 .stSelectbox > div > div,
-.stNumberInput > div > div > input {
-    background: var(--surface2) !important;
-    border: 1px solid var(--border) !important;
-    color: var(--text) !important;
-    border-radius: 8px !important;
-    font-family: 'Inter', sans-serif !important;
-}
-
-label, .stTextInput label, .stSelectbox label, .stFileUploader label {
-    color: var(--muted) !important;
-    font-size: 0.82rem !important;
-    font-family: 'DM Mono', monospace !important;
-    letter-spacing: 0.05em !important;
-    text-transform: uppercase !important;
-}
-
-.stProgress > div > div > div {
-    background: linear-gradient(90deg, var(--accent), var(--accent2)) !important;
-}
-
-hr { border-color: var(--border) !important; }
-
-.stExpander {
-    border: 1px solid var(--border) !important;
-    border-radius: 10px !important;
+.stNumberInput > div > div > input,
+.stMultiSelect > div > div {
     background: var(--surface) !important;
+    border: 1px solid var(--border2) !important;
+    color: var(--text) !important;
+    border-radius: 7px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.9rem !important;
+}
+.stTextInput > div > div > input:focus,
+.stNumberInput > div > div > input:focus {
+    border-color: var(--brand-navy) !important;
+    box-shadow: 0 0 0 3px rgba(31, 58, 95, 0.08) !important;
+}
+
+/* Labels */
+.stTextInput label, .stSelectbox label, .stFileUploader label,
+.stMultiSelect label, .stNumberInput label {
+    color: var(--text2) !important;
+    font-size: 0.85rem !important;
+    font-weight: 500 !important;
+    text-transform: none !important;
+    margin-bottom: 0.3rem !important;
+}
+
+/* Help text & captions */
+.stCaption, [data-testid="stCaptionContainer"] {
+    color: var(--muted) !important;
+    font-size: 0.8rem !important;
+}
+
+/* Horizontal rules */
+hr {
+    border: none !important;
+    border-top: 1px solid var(--border) !important;
+    margin: 1rem 0 !important;
+}
+
+/* Progress bar */
+.stProgress > div > div > div { background: var(--brand-navy) !important; }
+
+/* Checklist items */
+.check-item {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    font-size: 0.85rem;
+    color: var(--text2);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.check-item.ok { background: #F1F6F2; border-color: #D5E1D7; }
+
+[data-testid="column"] { padding: 0 0.4rem !important; }
+
+.stAlert {
+    border-radius: 8px !important;
+    border: 1px solid var(--border) !important;
+}
+
+/* Output mini-card */
+.output-mini {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    text-align: center;
+    margin-bottom: 0.6rem;
+}
+.output-mini-icon { font-size: 1.6rem; }
+.output-mini-title {
+    font-weight: 600;
+    color: var(--brand-navy);
+    margin-top: 0.2rem;
+}
+.output-mini-sub {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.25rem;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -943,7 +1137,6 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
         _seq += 1
     next_unknown_seq = _seq
 
-    # Default column priority if not provided from UI
     _default_col_order = [
         "Construction Design Specification Notes",
         "Client Specification",
@@ -1065,15 +1258,13 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
             seq_number += 1
 
 # ================================================================
-# CORE PROCESSING FUNCTION (replaces the main loop)
+# CORE PROCESSING FUNCTION
 # ================================================================
 def process_property(
     cr_path, sn_path, epr_path,
     template_bytes,
     ss_token, sheet_id, second_sheet_id,
     sheet10_b3, sheet10_f3,
-    prop_name,
-    duckdb_path,
     spec_col_order,
     log
 ):
@@ -1123,6 +1314,16 @@ def process_property(
     if matched_row is None:
         log(f"⚠️  No address match found in Smartsheet — continuing with blank Smartsheet fields")
         matched_address = selected_measures = property_id_value = sap_potential = sap_current = ""
+        conservation_flag = ""
+        listed_building   = ""
+        radon_risk        = ""
+        flood_risk        = ""
+        subs2030          = ""
+        subs2070          = ""
+        wdr_risk          = ""
+        rainfall_risk     = ""
+        wind_speed_risk   = ""
+        wildfire_risk     = ""
     else:
         log(f"✅ ADDRESS MATCH found in Smartsheet")
         matched_address   = matched_row["Address"]
@@ -1130,6 +1331,19 @@ def process_property(
         property_id_value = matched_row.get("Property ID", "")
         sap_potential     = matched_row.get("Proposed Post SAP Score", "")
         sap_current       = matched_row.get("Pre SAP Score (Full SAP)", "")
+
+        conservation_flag = matched_row.get(CONSERVATION_AREA_COL, "")
+        listed_building   = matched_row.get(LISTED_BUILDING_COL, "")
+        radon_risk        = matched_row.get(RADON_RISK_COL, "")
+        flood_risk_raw    = matched_row.get(FLOOD_RISK_COL, "")
+        flood_risk        = "No" if (flood_risk_raw is None or pd.isna(flood_risk_raw) or str(flood_risk_raw).strip() == "") else flood_risk_raw
+        subs2030          = matched_row.get(SUBS_2030_COL, "")
+        subs2070          = matched_row.get(SUBS_2070_COL, "")
+        wdr_risk          = matched_row.get(WDR_RISK_COL, "")
+        rainfall_risk     = matched_row.get(RAINFALL_RISK_COL, "")
+        wind_speed_risk   = matched_row.get(WIND_SPEED_RISK_COL, "")
+        wildfire_risk     = matched_row.get(WILDFIRE_RISK_COL, "")
+        log(f"🌍 Climate flags → Conservation: {conservation_flag} | Radon: {radon_risk} | Flood: {flood_risk}")
 
     # -- Coordinates --
     latitude, longitude = extract_lat_lon_from_cr(cr_path)
@@ -1178,81 +1392,6 @@ def process_property(
     highest_bedroom = extract_highest_bedroom_from_contents(read_pdf_page_lines(cr_path, 1))
     log(f"🏠 Bedrooms: {highest_bedroom} | TFA: {tfa} | Tenure: {tenure}")
 
-    # -- Geo risks via DuckDB --
-    log("🗺️  Querying geo risk database...")
-    lon_f = float(longitude)
-    lat_f = float(latitude)
-    con = duckdb.connect(duckdb_path)
-    con.execute("INSTALL spatial;")
-    con.execute("LOAD spatial;")
-
-    query = f"""
-    WITH point AS (SELECT ST_Point({lon_f}, {lat_f}) AS geom),
-    la AS (SELECT * FROM la_districts WHERE ST_Contains(geom, (SELECT geom FROM point)))
-    SELECT
-        CASE WHEN EXISTS (
-            SELECT 1 FROM conservation WHERE ST_Contains(geom, (SELECT geom FROM point))
-        ) THEN 'Yes' ELSE 'No' END AS conservation,
-        (SELECT CASE CLASS_MAX
-            WHEN 1 THEN 'Very Low' WHEN 2 THEN 'Low' WHEN 3 THEN 'Moderate'
-            WHEN 4 THEN 'High' WHEN 5 THEN 'Very High' WHEN 6 THEN 'Extremely High'
-            ELSE 'Unknown' END
-         FROM radon WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS radon,
-        (SELECT "flood-risk-level"
-         FROM flood WHERE ST_Contains(geom, (SELECT geom FROM point))
-         ORDER BY "flood-risk-level" DESC LIMIT 1) AS flood,
-        (SELECT CLASS FROM subs2030 WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS subs2030,
-        (SELECT CLASS FROM subs2070 WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS subs2070,
-        (SELECT CASE
-            WHEN AVG_WDR_baseline_Median <= 100 THEN 'Very Low'
-            WHEN AVG_WDR_baseline_Median <= 200 THEN 'Low'
-            WHEN AVG_WDR_baseline_Median <= 300 THEN 'Moderate'
-            WHEN AVG_WDR_baseline_Median <= 400 THEN 'High'
-            WHEN AVG_WDR_baseline_Median <= 500 THEN 'Very High'
-            ELSE 'Extremely High' END
-         FROM wdr WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS wdr,
-        (SELECT CASE
-            WHEN avg_pr < 60  THEN 'Very Low'    WHEN avg_pr < 80  THEN 'Low'
-            WHEN avg_pr < 100 THEN 'Below Moderate' WHEN avg_pr < 120 THEN 'Moderate'
-            WHEN avg_pr < 140 THEN 'Above Moderate' WHEN avg_pr < 160 THEN 'High'
-            WHEN avg_pr < 180 THEN 'Very High'   WHEN avg_pr < 200 THEN 'Extremely High'
-            WHEN avg_pr < 240 THEN 'Severe'      ELSE 'Exceptional' END
-         FROM (
-            SELECT (prJan+prFeb+prMar+prApr+prMay+prJun+prJul+prAug+prSep+prOct+prNov+prDec)/12.0 AS avg_pr, geom
-            FROM rainfall
-         ) r WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS rainfall,
-        (SELECT CASE
-            WHEN avg_ws < 4  THEN 'Very Low' WHEN avg_ws < 6  THEN 'Low'
-            WHEN avg_ws < 8  THEN 'Moderate' WHEN avg_ws < 10 THEN 'High'
-            ELSE 'Very High' END
-         FROM (
-            SELECT (ws_winter_baseline_median+ws_spring_baseline_median+ws_summer_baseline_median+ws_autumn_baseline_median)/4.0 AS avg_ws, geom
-            FROM windspeed
-         ) w WHERE ST_Contains(geom, (SELECT geom FROM point)) LIMIT 1) AS wind,
-        (SELECT CASE
-            WHEN w."Wildfire incidents (number)" / w."Area (square kilometres)" < 1.18  THEN 'Low'
-            WHEN w."Wildfire incidents (number)" / w."Area (square kilometres)" < 4.88  THEN 'Moderate'
-            WHEN w."Wildfire incidents (number)" / w."Area (square kilometres)" < 13.5  THEN 'High'
-            ELSE 'Very High' END
-         FROM wildfire w JOIN la ON la."name" = w."Local authority district" LIMIT 1) AS wildfire,
-        (SELECT la."name" FROM la LIMIT 1) AS local_authority_name
-    """
-    result = con.execute(query).fetchdf().iloc[0].to_dict()
-    con.close()
-
-    conservation_flag    = result.get("conservation", "")
-    radon_risk           = result.get("radon", "")
-    flood_risk_raw       = result.get("flood")
-    flood_risk           = "No" if (flood_risk_raw is None or pd.isna(flood_risk_raw) or str(flood_risk_raw).strip() == "") else flood_risk_raw
-    subs2030             = result.get("subs2030", "")
-    subs2070             = result.get("subs2070", "")
-    wdr_risk             = result.get("wdr", "")
-    rainfall_risk        = result.get("rainfall", "")
-    wind_speed_risk      = result.get("wind", "")
-    wildfire_risk        = result.get("wildfire", "")
-    local_authority_name = result.get("local_authority_name", "")
-    log(f"🏛️  Local Authority (DB): {local_authority_name} | Conservation: {conservation_flag}")
-
     # -- Fetch client spec sheet --
     log("🔗 Fetching Smartsheet Client Specification...")
     df_specs = fetch_client_spec_df(ss_token, second_sheet_id)
@@ -1261,7 +1400,7 @@ def process_property(
     wb_data = {
         "dwelling_address":           dwelling_address,
         "property_id_value":          property_id_value,
-        "local_authority_name":       sheet10_b3,   # from Sheet 10 B3 input
+        "local_authority_name":       sheet10_b3,
         "sap_current":                sap_current,
         "sap_potential":              sap_potential,
         "tenure":                     tenure,
@@ -1273,6 +1412,7 @@ def process_property(
         "exposure_zone":              exposure_zone,
         "property_construction_flag": property_construction_flag,
         "conservation_flag":          conservation_flag,
+        "listed_building":            listed_building,
         "property_constraints_val":   property_constraints_val,
         "vulnerable_flag":            vulnerable_flag,
         "tfa_sqm":                    tfa.replace("m", "sqm") if tfa else "",
@@ -1330,38 +1470,60 @@ def process_property(
     elapsed = time.time() - start_time
     log(f"⏱️  Completed in {elapsed:.1f}s")
 
-    return prelim_buffer, construction_buffer, prop_name, dwelling_address
+    return prelim_buffer, construction_buffer, dwelling_address
 
 # ================================================================
 # STREAMLIT UI
 # ================================================================
 
-# Hero header
-st.markdown('<div class="hero-title">Retrofit Design Exporter</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Elmhurst CR · SN · EPR → Excel Design Pack</div>', unsafe_allow_html=True)
+# ── LOGO HEADER ──────────────────────────────────────────────────
+# ── LOGO HEADER ──────────────────────────────────────────────────
+if LOGO_B64:
+    st.markdown(
+        f'''
+        <div class="logo-wrap">
+            <img src="data:image/png;base64,{LOGO_B64}" alt="Design Specifics" />
+            <div class="logo-divider"></div>
+            <div>
+                <div class="logo-title">Design Specifics · Retrofit Design Exporter</div>
+                <div class="logo-subtitle">Elmhurst CR · SN · EPR → Excel Design Pack</div>
+            </div>
+        </div>
+        ''',
+        unsafe_allow_html=True
+    )
+else:
+    st.markdown(
+        '''
+        <div class="logo-wrap">
+            <div>
+                <div class="logo-title">Design Specifics · Retrofit Design Exporter</div>
+                <div class="logo-subtitle">Logo not found. Place <code>Design_Specifics_logo.png</code> inside the <code>template/</code> folder.</div>
+            </div>
+        </div>
+        ''',
+        unsafe_allow_html=True
+    )
 
-# ── SIDEBAR — Credentials & Config ──────────────────────────────
+# ── SIDEBAR — Sheet IDs, Sheet 10 values, Spec priority, Template ──
 with st.sidebar:
-    st.markdown('<div class="card-label">⚙ Configuration</div>', unsafe_allow_html=True)
-    st.markdown("---")
+    st.markdown("### Configuration")
+    st.markdown("")
 
-    st.markdown('<div class="card-label">Smartsheet</div>', unsafe_allow_html=True)
-    ss_token = st.text_input("API Token", type="password", placeholder="rWR95nWpa9TMOOs...", key="ss_token")
+    st.markdown("**Smartsheet IDs**")
     sheet_id = st.text_input("IOE Sheet ID", placeholder="74429503768452", key="sheet_id")
     second_sheet_id = st.text_input("Client Spec Sheet ID", placeholder="1408360446560132", key="second_sheet_id")
 
     st.markdown("---")
-    st.markdown('<div class="card-label">Sheet 10 — Local Authority</div>', unsafe_allow_html=True)
+
+    st.markdown("**Sheet 10 — Local Authority**")
     sheet10_b3 = st.text_input("Local Authority Name (B3)", placeholder="e.g. Croydon Council", key="b3")
     sheet10_f3 = st.text_input("Year (F3)", placeholder="e.g. 2026", key="f3")
 
     st.markdown("---")
-    st.markdown('<div class="card-label">Database</div>', unsafe_allow_html=True)
-    duckdb_path = st.text_input("DuckDB File Path", placeholder=r"data/uk_risk.duckdb", key="duckdb")
 
-    st.markdown("---")
-    st.markdown('<div class="card-label">📑 Client Spec — Column Priority</div>', unsafe_allow_html=True)
-    st.caption("Drag to reorder — top column is checked first. First non-empty value wins.")
+    st.markdown("**Client Spec — Column Priority**")
+    st.caption("Paste the exact column names below. Top column is checked first. First non-empty value wins.")
 
     ALL_SPEC_COLS = [
         "Construction Design Specification Notes",
@@ -1369,84 +1531,102 @@ with st.sidebar:
         "Design Specification Notes",
     ]
 
-    # Let user pick which columns to include and in what order via multiselect
-    # (Streamlit doesn't have drag-to-reorder natively, so we use ordered multiselect)
-    spec_col_order = st.multiselect(
-        "Column lookup order (top = highest priority)",
-        options=ALL_SPEC_COLS,
-        default=ALL_SPEC_COLS,
-        help="Select columns in the priority order you want. Deselect any column to skip it entirely.",
-        key="spec_col_order",
+    spec_col_text = st.text_area(
+        "Paste column names",
+        value="\n".join(ALL_SPEC_COLS),
+        height=115,
+        key="spec_col_text",
+        label_visibility="collapsed",
+        placeholder="Construction Design Specification Notes\nClient Specification\nDesign Specification Notes",
     )
-    if not spec_col_order:
-        st.warning("⚠️ No spec columns selected — spec cells will be blank.")
-        spec_col_order = ALL_SPEC_COLS  # fallback to default
 
-    # Show current active priority as numbered badges
+    spec_col_order = [
+        c.strip().strip(",")
+        for c in re.split(r"[\n,]+", spec_col_text)
+        if c.strip()
+    ]
+
+    if not spec_col_order:
+        st.warning("⚠️ No spec columns pasted — default column priority will be used.")
+        spec_col_order = ALL_SPEC_COLS
+
     for i, col in enumerate(spec_col_order, 1):
         short = col.replace(" Specification", " Spec").replace("Construction Design ", "CD ")
         st.markdown(
-            f'<div style="font-family:\'DM Mono\',monospace;font-size:0.72rem;color:#94a3b8;padding:2px 0">'
-            f'<span style="color:#00e5a0;font-weight:700">{i}.</span> {short}</div>',
+            f'<div style="font-size:0.78rem;color:#4A5A72;padding:3px 0">'
+            f'<span style="color:#1F3A5F;font-weight:600">{i}.</span> {short}</div>',
             unsafe_allow_html=True
         )
 
     st.markdown("---")
-    st.markdown('<div class="card-label">Excel Template</div>', unsafe_allow_html=True)
-    template_file = st.file_uploader("Upload DESIGN EXPORT TEMPLATE.xlsx", type=["xlsx"], key="template")
-    if template_file:
-        st.markdown('<span class="badge">✓ Template loaded</span>', unsafe_allow_html=True)
+
+    st.markdown("**Excel Template**")
+    if BUILTIN_TEMPLATE_PATH.exists():
+        st.markdown('<span class="badge">✓ Built-in template loaded</span>', unsafe_allow_html=True)
+        st.caption(f"Using: {BUILTIN_TEMPLATE_PATH.name}")
+    else:
+        st.markdown('<span class="badge badge-warn">⚠ Template missing</span>', unsafe_allow_html=True)
+        st.caption("Place DESIGN EXPORT TEMPLATE.xlsx inside the assets folder.")
 
 # ── MAIN AREA ────────────────────────────────────────────────────
-col_left, col_right = st.columns([1.1, 0.9], gap="large")
+col_left, col_right = st.columns([1.15, 0.85], gap="large")
 
 with col_left:
-    st.markdown('<div class="card"><div class="card-label">📂 PDF Upload — Three Files Required</div>', unsafe_allow_html=True)
+    # ── INPUTS CARD: 3 PDFs together ──
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-label">Inputs</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-hint">Upload the three Elmhurst PDFs. The Smartsheet token and Excel template are loaded automatically from the app setup.</div>', unsafe_allow_html=True)
 
-    prop_name_input = st.text_input(
-        "Property Name / Reference",
-        placeholder="e.g. 12 Oak Street NW10 4AB",
-        key="prop_name"
-    )
-
+    # Three PDF uploaders side by side
     c1, c2, c3 = st.columns(3)
     with c1:
-        cr_file  = st.file_uploader("CR PDF", type=["pdf"], help="Condition Report — filename must contain 'cr' or 'condition'")
+        cr_file  = st.file_uploader("CR PDF", type=["pdf"], help="Condition Report")
     with c2:
-        sn_file  = st.file_uploader("SN PDF", type=["pdf"], help="Survey Notes — filename must contain 'sn'")
+        sn_file  = st.file_uploader("SN PDF", type=["pdf"], help="Survey Notes")
     with c3:
-        epr_file = st.file_uploader("EPR PDF", type=["pdf"], help="Energy Performance Report — filename must contain 'epr'")
+        epr_file = st.file_uploader("EPR PDF", type=["pdf"], help="Energy Performance Report")
+    st.markdown('</div>', unsafe_allow_html=True)
 
+    # ── CHECKLIST ──
     ready_flags = {
-        "Template": template_file is not None,
-        "CR PDF": cr_file is not None,
-        "SN PDF": sn_file is not None,
-        "EPR PDF": epr_file is not None,
-        "Smartsheet Token": bool(ss_token),
-        "IOE Sheet ID": bool(sheet_id),
-        "Client Spec Sheet ID": bool(second_sheet_id),
-        "DuckDB Path": bool(duckdb_path),
-        "Property Name": bool(prop_name_input),
+        "Smartsheet Token":      bool(SMARTSHEET_API_TOKEN),
+        "Built-in Excel Template": BUILTIN_TEMPLATE_PATH.exists(),
+        "CR PDF":                cr_file is not None,
+        "SN PDF":                sn_file is not None,
+        "EPR PDF":               epr_file is not None,
+        "IOE Sheet ID":          bool(sheet_id),
+        "Client Spec Sheet ID":  bool(second_sheet_id),
+        "Local Authority":       bool(sheet10_b3),
     }
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-label">Pre-flight Checklist</div>', unsafe_allow_html=True)
 
-    # Checklist
-    st.markdown('<div class="card"><div class="card-label">✔ Pre-flight Checklist</div>', unsafe_allow_html=True)
-    chk_cols = st.columns(3)
+    chk_cols = st.columns(2)
     for i, (label, ok) in enumerate(ready_flags.items()):
-        icon = "🟢" if ok else "🔴"
-        chk_cols[i % 3].markdown(f"{icon} **{label}**")
-    st.markdown("</div>", unsafe_allow_html=True)
+        icon = "✓" if ok else "○"
+        color = "#5B8F73" if ok else "#A0A6B3"
+        cls = "ok" if ok else ""
+        chk_cols[i % 2].markdown(
+            f'<div class="check-item {cls}">'
+            f'<span style="color:{color};font-weight:700;font-size:1rem">{icon}</span>'
+            f'<span>{label}</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
     all_ready = all(ready_flags.values())
 
-    run_btn = st.button("🚀 Generate Excel Reports", disabled=not all_ready)
+    run_btn = st.button("Generate Excel Reports", disabled=not all_ready)
 
 with col_right:
-    st.markdown('<div class="card"><div class="card-label">📋 Processing Log</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-label">Processing Log</div>', unsafe_allow_html=True)
     log_placeholder = st.empty()
-    st.markdown("</div>", unsafe_allow_html=True)
+    log_placeholder.markdown('<div class="log-box"><span class="log-empty">Waiting to start…</span></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     result_placeholder = st.empty()
 
@@ -1485,36 +1665,31 @@ if run_btn:
             f.write(epr_file.read())
             epr_path = f.name
 
-        template_bytes = template_file.read()
+        template_bytes = load_builtin_template_bytes()
 
-        log(f"🚀 Starting processing: {prop_name_input}")
+        log("🚀 Starting processing…")
 
-        prelim_buf, construction_buf, prop_name, dwelling_address = process_property(
+        prelim_buf, construction_buf, dwelling_address = process_property(
             cr_path=cr_path,
             sn_path=sn_path,
             epr_path=epr_path,
             template_bytes=template_bytes,
-            ss_token=ss_token,
+            ss_token=SMARTSHEET_API_TOKEN,
             sheet_id=int(sheet_id),
             second_sheet_id=int(second_sheet_id),
             sheet10_b3=sheet10_b3,
             sheet10_f3=sheet10_f3,
-            prop_name=prop_name_input,
-            duckdb_path=duckdb_path,
             spec_col_order=spec_col_order,
             log=log,
         )
 
         log("🎉 Both outputs generated successfully!")
 
-        # Store results in session state for download buttons
-        st.session_state["prelim_buf"]        = prelim_buf.getvalue()
-        st.session_state["construction_buf"]  = construction_buf.getvalue()
-        st.session_state["prop_name_result"] = prop_name_input
-        st.session_state["dwelling_address"]  = dwelling_address
-        st.session_state["results_ready"]     = True
+        st.session_state["prelim_buf"]       = prelim_buf.getvalue()
+        st.session_state["construction_buf"] = construction_buf.getvalue()
+        st.session_state["dwelling_address"] = dwelling_address
+        st.session_state["results_ready"]    = True
 
-        # Cleanup temp files
         for p in [cr_path, sn_path, epr_path]:
             try: os.unlink(p)
             except: pass
@@ -1527,27 +1702,23 @@ if run_btn:
 
 # ── DOWNLOAD SECTION ──────────────────────────────────────────────
 if st.session_state.get("results_ready"):
-    addr   = st.session_state.get("dwelling_address", "property")
-    pname = st.session_state.get("prop_name_result", "property")
-    safe   = re.sub(r"[^\w\s-]", "", pname).strip().replace(" ", "_")
+    addr = st.session_state.get("dwelling_address", "property")
+    safe = re.sub(r"[^\w\s-]", "", addr).strip().replace(" ", "_") or "property"
 
     with result_placeholder.container():
-        st.markdown("""
-        <div class="card">
-        <div class="card-label">⬇ Download Outputs</div>
-        """, unsafe_allow_html=True)
-
-        st.markdown(f'<span class="badge badge-blue">📍 {addr}</span>', unsafe_allow_html=True)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-label">Download Outputs</div>', unsafe_allow_html=True)
+        st.markdown(f'<span class="badge badge-brand">📍 {addr}</span>', unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
         dcol1, dcol2 = st.columns(2)
 
         with dcol1:
             st.markdown("""
-            <div style="background:#1c2030;border:1px solid #2a2f3e;border-radius:10px;padding:1rem;text-align:center;margin-bottom:0.5rem">
-                <div style="font-size:2rem">📄</div>
-                <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;color:#e2e8f0">Prelim Report</div>
-                <div style="font-size:0.72rem;color:#64748b;font-family:'DM Mono',monospace;margin-top:0.3rem">No climate risk data</div>
+            <div class="output-mini">
+                <div class="output-mini-icon">📄</div>
+                <div class="output-mini-title">Prelim Report</div>
+                <div class="output-mini-sub">No climate risk data</div>
             </div>
             """, unsafe_allow_html=True)
             st.download_button(
@@ -1561,10 +1732,10 @@ if st.session_state.get("results_ready"):
 
         with dcol2:
             st.markdown("""
-            <div style="background:#1c2030;border:1px solid #2a2f3e;border-radius:10px;padding:1rem;text-align:center;margin-bottom:0.5rem">
-                <div style="font-size:2rem">🏗️</div>
-                <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;color:#e2e8f0">Construction Report</div>
-                <div style="font-size:0.72rem;color:#64748b;font-family:'DM Mono',monospace;margin-top:0.3rem">Includes climate risk data</div>
+            <div class="output-mini">
+                <div class="output-mini-icon">🏗️</div>
+                <div class="output-mini-title">Construction Report</div>
+                <div class="output-mini-sub">Includes climate risk data</div>
             </div>
             """, unsafe_allow_html=True)
             st.download_button(
@@ -1576,13 +1747,13 @@ if st.session_state.get("results_ready"):
                 use_container_width=True,
             )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # ── FOOTER ────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
-    '<div style="text-align:center;color:#334155;font-family:\'DM Mono\',monospace;font-size:0.72rem;letter-spacing:0.08em">'
-    'RETROFIT DESIGN EXPORTER · ELMHURST CR / SN / EPR → EXCEL'
+    '<div style="text-align:center;color:#A0A6B3;font-size:0.78rem;padding:0.5rem 0">'
+    'Design Specifics · Design Matters'
     '</div>',
     unsafe_allow_html=True
 )
