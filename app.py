@@ -40,7 +40,7 @@ WILDFIRE_RISK_COL     = "Wildfire Risk"
 # PAGE CONFIG
 # ================================================================
 st.set_page_config(
-    page_title="Design Specifics · Retrofit Design Exporter",
+    page_title="Power Asset · Retrofit Design Exporter",
     page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="expanded",
