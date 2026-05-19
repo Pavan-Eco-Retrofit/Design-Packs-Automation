@@ -1603,7 +1603,7 @@ if LOGO_B64:
             <img src="data:image/png;base64,{LOGO_B64}" alt="Design Specifics" />
             <div class="logo-divider"></div>
             <div>
-                <div class="logo-title">Design Specifics · Retrofit Design Exporter</div>
+                <div class="logo-title">Power Asset · Retrofit Design Exporter</div>
                 <div class="logo-subtitle">Elmhurst CR · SN · EPR → Excel Design Pack</div>
             </div>
         </div>
@@ -1615,7 +1615,7 @@ else:
         '''
         <div class="logo-wrap">
             <div>
-                <div class="logo-title">Design Specifics · Retrofit Design Exporter</div>
+                <div class="logo-title">Power Asset · Retrofit Design Exporter</div>
                 <div class="logo-subtitle">Logo not found. Place <code>Design_Specifics_logo.png</code> inside the <code>template/</code> folder.</div>
             </div>
         </div>
