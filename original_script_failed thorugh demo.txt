@@ -641,21 +641,79 @@ Q_WINDOWS      = "Does the room have any windows?"
 Q_FANS         = "Does the room have fans fitted?"
 
 
+def normalize_pdf_line(x):
+    return re.sub(r"\s+", " ", str(x).strip())
+
+
 def extract_yes_no_strict(lines, question):
-    for line in lines:
-        if line.startswith(question):
-            parts = line.split("?", 1)
-            if len(parts) == 2 and parts[1].strip() in ("Yes", "No"):
-                return parts[1].strip()
+    """
+    Same function name, but improved process.
+    Handles:
+    1. Question and answer on same line
+    2. Question on one line and Yes/No on next line
+    3. Extra PDF spaces
+    """
+    q_norm = normalize_pdf_line(question).lower()
+
+    clean = [normalize_pdf_line(l) for l in lines if normalize_pdf_line(l)]
+
+    for i, line in enumerate(clean):
+        line_norm = line.lower()
+
+        # Case 1: question and answer are on same line
+        if line_norm.startswith(q_norm):
+            after_question = line[len(question):].strip()
+
+            if after_question in ("Yes", "No"):
+                return after_question
+
+            # Sometimes answer is after ?
+            if "?" in line:
+                tail = line.split("?", 1)[1].strip()
+                if tail in ("Yes", "No"):
+                    return tail
+
+            # Case 2: answer is on next few lines
+            for nxt in clean[i + 1:i + 5]:
+                if nxt in ("Yes", "No"):
+                    return nxt
+
             return None
+
+        # Case 3: PDF slightly changes spacing, but contains same question
+        if q_norm in line_norm:
+            if "Yes" in line:
+                return "Yes"
+            if "No" in line:
+                return "No"
+
+            for nxt in clean[i + 1:i + 5]:
+                if nxt in ("Yes", "No"):
+                    return nxt
+
+            return None
+
     return None
 
 
 def extract_mm2_strict(lines):
-    for line in lines:
+    clean = [normalize_pdf_line(l) for l in lines if normalize_pdf_line(l)]
+
+    for i, line in enumerate(clean):
         if line.startswith(Q_BG_AREA):
             tail = line.replace(Q_BG_AREA, "").strip()
-            return tail if tail.isdigit() else None
+
+            if tail.isdigit():
+                return tail
+
+            # If value is on next few lines
+            for nxt in clean[i + 1:i + 5]:
+                m = re.search(r"\b(\d{3,6})\b", nxt)
+                if m:
+                    return m.group(1)
+
+            return None
+
     return None
 
 
