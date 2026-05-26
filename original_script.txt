@@ -265,90 +265,6 @@ def fetch_smartsheet_df():
 
 
 # ================================================================
-# PROPERTY MASTER LOOKUP USING PROPERTY ID
-# ================================================================
-PROPERTY_MASTER_ID_COL_OPTIONS = [
-    "Property ID",
-    "Property_ID",
-    "Property Id",
-    "property_id",
-]
-
-PROPERTY_MASTER_RISK_COLS = [
-    CONSERVATION_AREA_COL,
-    LISTED_BUILDING_COL,
-    RADON_RISK_COL,
-    FLOOD_RISK_COL,
-    SUBS_2030_COL,
-    SUBS_2070_COL,
-    WDR_RISK_COL,
-    RAINFALL_RISK_COL,
-    WIND_SPEED_RISK_COL,
-    WILDFIRE_RISK_COL,
-]
-
-
-def normalize_property_id(x):
-    if pd.isna(x):
-        return ""
-    return re.sub(r"[^a-z0-9]", "", str(x).strip().lower())
-
-
-def get_first_existing_col(df, possible_cols):
-    for col in possible_cols:
-        if col in df.columns:
-            return col
-    return None
-
-
-def get_safe_value(row, col_name, default=""):
-    if row is None or col_name not in row.index:
-        return default
-    val = row.get(col_name, default)
-    if val is None or pd.isna(val):
-        return default
-    return str(val).strip()
-
-
-def fetch_property_master_df():
-    url = f"https://api.smartsheet.eu/2.0/sheets/{PROPERTY_MASTER_SHEET_ID}"
-    r = requests.get(url, headers=SM_HEADERS)
-    r.raise_for_status()
-    sheet = r.json()
-    col_map = {c["id"]: c["title"] for c in sheet["columns"]}
-    rows = []
-    for row in sheet["rows"]:
-        d = {col_map[cell["columnId"]]: cell.get("displayValue", cell.get("value", "")) for cell in row["cells"]}
-        rows.append(d)
-    return pd.DataFrame(rows)
-
-
-def find_property_master_row(df_master, property_id_value):
-    if df_master is None or df_master.empty:
-        return None
-
-    master_id_col = get_first_existing_col(df_master, PROPERTY_MASTER_ID_COL_OPTIONS)
-    if not master_id_col:
-        raise ValueError(
-            "Property Master sheet does not contain a Property ID column. "
-            "Expected one of: Property ID, Property_ID, Property Id, property_id"
-        )
-
-    target_id = normalize_property_id(property_id_value)
-    if not target_id:
-        return None
-
-    df_master = df_master.copy()
-    df_master["_n_property_id"] = df_master[master_id_col].apply(normalize_property_id)
-    matches = df_master[df_master["_n_property_id"] == target_id]
-
-    if matches.empty:
-        return None
-
-    return matches.iloc[0]
-
-
-# ================================================================
 # COORDINATES
 # ================================================================
 def dms_to_dd(deg, minutes, sec, direction):
@@ -467,170 +383,6 @@ def extract_highest_bedroom_from_contents(cr_page2_lines):
 
 
 # ================================================================
-# ROOM EXTRACTION FROM CONTENTS PAGE
-# — Fully rewritten to be robust against Elmhurst-style PDFs
-#
-# Strategy:
-#   1. Read page 1 (0-indexed) as raw lines.
-#   2. Build a paired list: (item_text, page_number) by matching
-#      lines that are purely numeric to the previous non-numeric line.
-#   3. Drop known non-room entries using a blocklist.
-#   4. Keep only entries that sit between the first recognised room
-#      keyword and the first end-section keyword.
-# ================================================================
-
-# Lines whose text matches these patterns are NEVER rooms
-_NON_ROOM_EXACT = {
-    "contents", "property details", "property summary", "occupancy",
-    "elevations", "elevation", "significance survey", "additional information",
-    "annex", "appendix", "notes", "floor plan", "floorplan",
-}
-
-# If any of these substrings appear in a line it is not a room
-_NON_ROOM_SUBSTRINGS = [
-    "element no", "significance", "elevation", "floorplan", "floor plan",
-    "property detail", "property summary", "additional info", "annex",
-    "appendix", "occupancy",
-]
-
-# Stop collecting rooms once we hit these (case-insensitive substring match)
-_END_SECTION_KEYWORDS = [
-    "occupancy", "significance", "elevation", "additional", "annex",
-    "appendix", "summary", "notes",
-]
-
-# A line is considered a room candidate if it contains at least one of these
-_ROOM_INDICATOR_KEYWORDS = [
-    "kitchen", "bathroom", "bedroom", "living", "lounge", "dining",
-    "hall", "hallway", "wc", "toilet", "utility", "wetroom", "wet room",
-    "study", "office", "conservatory", "landing", "store", "cupboard",
-    "reception", "playroom", "cellar", "loft", "attic", "en suite",
-    "en-suite", "ensuite", "cloakroom",
-]
-
-
-def _is_non_room(text: str) -> bool:
-    """Return True if this line should never be treated as a room."""
-    t = text.strip().lower()
-    if t in _NON_ROOM_EXACT:
-        return True
-    for sub in _NON_ROOM_SUBSTRINGS:
-        if sub in t:
-            return True
-    return False
-
-
-def _is_end_section(text: str) -> bool:
-    t = text.strip().lower()
-    return any(kw in t for kw in _END_SECTION_KEYWORDS)
-
-
-def _looks_like_room(text: str) -> bool:
-    t = text.strip().lower()
-    return any(kw in t for kw in _ROOM_INDICATOR_KEYWORDS)
-
-
-def extract_rooms_from_contents(cr_pdf_path: str) -> list:
-    """
-    Parse the Contents page (PDF page index 1) of an Elmhurst CR PDF
-    and return a list of room names in document order.
-
-    Returns an empty list (never raises) so the caller can decide
-    what to do when no rooms are found.
-    """
-    raw_lines = read_pdf_page_lines(cr_pdf_path, 1)
-
-    # ── Step 1: strip whitespace, drop blank lines and page-header noise ──
-    cleaned = []
-    for line in raw_lines:
-        s = line.strip()
-        if not s:
-            continue
-        # Drop lines that are purely "Page N" or "page N"
-        if re.match(r"^page\s+\d+$", s, re.IGNORECASE):
-            continue
-        cleaned.append(s)
-
-    if not cleaned:
-        return []
-
-    # ── Step 2: pair item names with their page numbers ──────────────────
-    # Elmhurst PDFs typically emit: "Room Name\n22\n" or interleaved.
-    # We walk the list; when we see a digit-only token after a text token
-    # we treat (text_token, digit_token) as a (name, page_no) pair.
-    pairs = []   # list of (name_str, page_no_int)
-    i = 0
-    while i < len(cleaned):
-        token = cleaned[i]
-        if token.isdigit():
-            # Orphan page number — try to attach to the previous pair's name
-            # (happens when name and number are on the same visual line but
-            #  the PDF emits them as two tokens)
-            if pairs:
-                # already have a pair; this is just noise — skip
-                pass
-            i += 1
-            continue
-        # Look ahead for a page number
-        if i + 1 < len(cleaned) and cleaned[i + 1].isdigit():
-            pairs.append((token, int(cleaned[i + 1])))
-            i += 2
-        else:
-            # No page number immediately follows; record with page_no=-1
-            pairs.append((token, -1))
-            i += 1
-
-    if not pairs:
-        return []
-
-    # ── Step 3: find the slice of pairs that represent actual rooms ───────
-    # We look for the first pair whose name looks like a room, then collect
-    # until we hit an end-section keyword.
-    start_idx = None
-    for idx, (name, _) in enumerate(pairs):
-        if _is_end_section(name):
-            break
-        if _looks_like_room(name) and not _is_non_room(name):
-            start_idx = idx
-            break
-
-    if start_idx is None:
-        # Fallback: take everything that is not a known non-room and not an
-        # end-section marker, skipping the first two entries (usually
-        # "Property Details" and "Property Summary").
-        print("  ⚠️  No recognised room keyword found; using fallback extraction.")
-        rooms = [
-            name for name, _ in pairs[2:]
-            if not _is_non_room(name) and not _is_end_section(name)
-        ]
-        return rooms
-
-    rooms = []
-    for name, _ in pairs[start_idx:]:
-        if _is_end_section(name):
-            break
-        if _is_non_room(name):
-            continue
-        rooms.append(name)
-
-    # ── Step 4: deduplicate while preserving order ────────────────────────
-    seen  = set()
-    dedup = []
-    for r in rooms:
-        key = r.strip().lower()
-        if key not in seen:
-            seen.add(key)
-            dedup.append(r)
-
-    dedup = [
-        r for r in dedup
-        if not re.search(r"^page\s+\d+\s+of\s+\d+$", str(r).strip(), re.I)
-    ]
-
-    return dedup
-
-
-# ================================================================
 # ROOM EXTRACTION QUESTIONS
 # ================================================================
 Q_CONDENSATION = "Is there any evidence of condensation, damp or mould growth in this room?"
@@ -641,79 +393,21 @@ Q_WINDOWS      = "Does the room have any windows?"
 Q_FANS         = "Does the room have fans fitted?"
 
 
-def normalize_pdf_line(x):
-    return re.sub(r"\s+", " ", str(x).strip())
-
-
 def extract_yes_no_strict(lines, question):
-    """
-    Same function name, but improved process.
-    Handles:
-    1. Question and answer on same line
-    2. Question on one line and Yes/No on next line
-    3. Extra PDF spaces
-    """
-    q_norm = normalize_pdf_line(question).lower()
-
-    clean = [normalize_pdf_line(l) for l in lines if normalize_pdf_line(l)]
-
-    for i, line in enumerate(clean):
-        line_norm = line.lower()
-
-        # Case 1: question and answer are on same line
-        if line_norm.startswith(q_norm):
-            after_question = line[len(question):].strip()
-
-            if after_question in ("Yes", "No"):
-                return after_question
-
-            # Sometimes answer is after ?
-            if "?" in line:
-                tail = line.split("?", 1)[1].strip()
-                if tail in ("Yes", "No"):
-                    return tail
-
-            # Case 2: answer is on next few lines
-            for nxt in clean[i + 1:i + 5]:
-                if nxt in ("Yes", "No"):
-                    return nxt
-
+    for line in lines:
+        if line.startswith(question):
+            parts = line.split("?", 1)
+            if len(parts) == 2 and parts[1].strip() in ("Yes", "No"):
+                return parts[1].strip()
             return None
-
-        # Case 3: PDF slightly changes spacing, but contains same question
-        if q_norm in line_norm:
-            if "Yes" in line:
-                return "Yes"
-            if "No" in line:
-                return "No"
-
-            for nxt in clean[i + 1:i + 5]:
-                if nxt in ("Yes", "No"):
-                    return nxt
-
-            return None
-
     return None
 
 
 def extract_mm2_strict(lines):
-    clean = [normalize_pdf_line(l) for l in lines if normalize_pdf_line(l)]
-
-    for i, line in enumerate(clean):
+    for line in lines:
         if line.startswith(Q_BG_AREA):
             tail = line.replace(Q_BG_AREA, "").strip()
-
-            if tail.isdigit():
-                return tail
-
-            # If value is on next few lines
-            for nxt in clean[i + 1:i + 5]:
-                m = re.search(r"\b(\d{3,6})\b", nxt)
-                if m:
-                    return m.group(1)
-
-            return None
-
+            return tail if tail.isdigit() else None
     return None
 
 
@@ -726,29 +420,14 @@ def get_room_page_range(contents, room):
         idx = contents.index(room)
     except ValueError:
         return None, None
-
-    start_page = None
-
-    # Find first page number after room name
-    for i in range(idx + 1, len(contents)):
-        if str(contents[i]).strip().isdigit():
-            start_page = int(str(contents[i]).strip())
+    start_page = int(contents[idx + 1])
+    next_page  = None
+    for i in range(idx + 2, len(contents)):
+        if contents[i].isdigit():
+            next_page = int(contents[i])
             break
-
-    if start_page is None:
-        return None, None
-
-    next_page = None
-
-    # Find next page number after start page
-    for j in range(i + 1, len(contents)):
-        if str(contents[j]).strip().isdigit():
-            next_page = int(str(contents[j]).strip())
-            break
-
     if next_page is None:
         return start_page - 1, start_page + 2
-
     return start_page - 1, next_page - 2
 
 
@@ -945,7 +624,6 @@ def write_room_row(ws, row, d, room):
 
 # ================================================================
 # MAIN ROOM INSERTION (Sheet 11.0)
-# — Uses the new robust extract_rooms_from_contents()
 # ================================================================
 def insert_rooms_with_template(
     cr_pdf_path,
@@ -958,12 +636,9 @@ def insert_rooms_with_template(
     tfa=None,
     highest_bedroom=0
 ):
-    ws = workbook[sheet_name]
-
-    # ── Keep the raw contents lines exactly like the old code ─────
+    ws           = workbook[sheet_name]
     contents_raw = read_pdf_page_lines(cr_pdf_path, 1)
 
-    # ── Build room list using the same old-code process ───────────
     cleaned = []
     for x in contents_raw:
         x = x.strip()
@@ -981,7 +656,6 @@ def insert_rooms_with_template(
         "Bedroom", "Bedroom 1", "Hall", "Hallway",
         "Bathroom", "WC", "w/c", "Toilet", "Utility"
     ]
-
     start_idx = 0
     for i, item in enumerate(cleaned):
         if any(s.lower() in item.lower() for s in possible_starts):
@@ -1003,7 +677,7 @@ def insert_rooms_with_template(
         raise ValueError("No rooms found in Contents page")
 
     rooms = sorted(rooms, key=wet_room_sort_key)
-    print(f"  📋 Found {len(rooms)} rooms (sorted): {rooms}")
+    print(f"📋 Found {len(rooms)} rooms (sorted): {rooms}")
 
     original_heights = {r: d.height for r, d in ws.row_dimensions.items() if d.height is not None}
     affected_merges  = unmerge_in_range(ws, insert_at_row)
@@ -1025,7 +699,7 @@ def insert_rooms_with_template(
         data = extract_room_data(cr_pdf_path, contents_raw, room)
         write_room_row(ws, row, data, room)
         found = " ".join(f"{k}={v}" for k, v in data.items() if v is not None)
-        print(f"    ✓ {room}: {found or 'No questions found'}")
+        print(f"  ✓ {room}: {found or 'No questions found'}")
 
     ws4        = workbook["4.0"]
     room_start = insert_at_row
@@ -1142,10 +816,27 @@ def write_sheet_10(workbook):
 
 
 # ================================================================
-# WRITE SHEET 7.0
+# WRITE SHEET 7.0  —  seq_number bug fully fixed
+#
+# FIX SUMMARY:
+#   The original code referenced `seq_number` and `next_seq` inside
+#   the unknown-measure block, but both were only defined AFTER that
+#   block ran — causing UnboundLocalError every time an unknown
+#   measure (e.g. "Heating Controls") was encountered.
+#
+#   Solution:
+#   1. Build `measure_seq_lookup` (known measure → seq number) and
+#      `next_unknown_seq` (counter for unknown measures) BEFORE the
+#      main measure loop, by walking SEQUENCE_ORDER once.
+#   2. Both known and unknown measures now always have a valid
+#      sequence number available immediately.
+#   3. A final authoritative pass at the end re-applies sequence
+#      numbers for known measures in the correct order, based on
+#      which ones actually have content in col D.
 # ================================================================
 def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_direction, ws4):
 
+    # ── Static lookup tables ──────────────────────────────────────
     measure_to_cell = {
         "Trickle Vents":       "A2",
         "Door undercuts":      "A4",
@@ -1212,15 +903,18 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
         ["SPV"],
     ]
 
-    # Pre-build sequence lookup
+    # ── PRE-BUILD sequence lookup BEFORE the main loop ────────────
+    # This guarantees seq_number is always defined when needed.
     measure_seq_lookup = {}
     _seq = 1
     for group in SEQUENCE_ORDER:
         for name in group:
             measure_seq_lookup[name] = _seq
         _seq += 1
+    # next_unknown_seq is used for measures not in SEQUENCE_ORDER
     next_unknown_seq = _seq
 
+    # ── Helper: get spec text for an abbreviation ─────────────────
     def get_spec(abbr: str) -> str:
         if df_specs.empty or "Abbreviation" not in df_specs.columns:
             return ""
@@ -1235,7 +929,8 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
             or ""
         )
 
-    def find_empty_d_row():
+    # ── Helper: find first empty D-column row ─────────────────────
+    def find_empty_d_row() -> int | None:
         for r in range(17, 23):
             if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
                 return r
@@ -1244,10 +939,13 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
                 return r
         return None
 
+    # ── Main measure loop ─────────────────────────────────────────
     measures_list = [m.strip() for m in selected_measures.split(",") if m.strip()]
     spv_included  = False
 
     for measure in measures_list:
+
+        # Match against a known measure key
         matched_key = None
         for key in measure_to_cell:
             if key.lower() in measure.lower():
@@ -1258,18 +956,28 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
             spv_included = True
 
         if matched_key is not None:
+            # ── KNOWN measure ─────────────────────────────────────
             row_num = int(measure_to_cell[matched_key][1:])
-            abbr    = abbrev_map.get(matched_key, "")
+
+            # Leave col A untouched (checkbox / formula)
+            abbr = abbrev_map.get(matched_key, "")
             ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
+
+            # Sequence number is guaranteed available from pre-built lookup
             seq = measure_seq_lookup.get(matched_key, next_unknown_seq)
             ws[get_master_cell(ws, f"G{row_num}")] = seq
+
             print(f"  ✓ Known measure '{matched_key}' → row {row_num}, seq {seq}")
+
         else:
+            # ── UNKNOWN measure ───────────────────────────────────
             row_num = find_empty_d_row()
+
             if row_num is None:
                 print(f"  ⚠️  No empty row found for '{measure}' — skipped")
                 continue
 
+            # Col B: measure name (unmerge if needed)
             b_master = get_master_cell(ws, f"B{row_num}")
             for merged in list(ws.merged_cells.ranges):
                 c1, r1, c2, r2 = range_boundaries(str(merged))
@@ -1278,6 +986,7 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
                     break
             ws[b_master] = measure
 
+            # Col C: abbreviation (unmerge if needed)
             abbr     = abbrev_map.get(measure, measure[:4].upper())
             c_master = get_master_cell(ws, f"C{row_num}")
             for merged in list(ws.merged_cells.ranges):
@@ -1286,12 +995,18 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
                     ws.unmerge_cells(str(merged))
                     break
             ws[c_master] = abbr
+
+            # Col D: spec
             ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
+
+            # Col G: sequence — next_unknown_seq is always defined here
             ws[get_master_cell(ws, f"G{row_num}")] = next_unknown_seq
             ws[get_master_cell(ws, f"H{row_num}")] = "Minor"
-            print(f"  ℹ️  Unknown measure '{measure}' → row {row_num}, seq {next_unknown_seq}")
-            next_unknown_seq += 1
 
+            print(f"  ℹ️  Unknown measure '{measure}' → row {row_num}, seq {next_unknown_seq}")
+            next_unknown_seq += 1   # increment so the next unknown gets a unique number
+
+    # ── SPV: F22/F23 only when SPV is selected ───────────────────
     if spv_included:
         if orientation_direction:
             ws[get_master_cell(ws, "F22")] = orientation_direction
@@ -1301,6 +1016,7 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
         ws[get_master_cell(ws, "F22")] = None
         ws[get_master_cell(ws, "F23")] = None
 
+    # ── Sheet 4.0 flags ───────────────────────────────────────────
     condition_met = any(
         ws[get_master_cell(ws, cell)].value not in (None, False, "", "FALSE")
         for cell in ["A5", "A6", "A7", "A8", "A10", "A12", "A13"]
@@ -1308,6 +1024,10 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
     ws4["H3"].value = "Yes" if condition_met else "No"
     ws4["H4"].value = "Yes" if condition_met else "No"
 
+    # ── Final authoritative sequence pass for KNOWN measures ──────
+    # Walk SEQUENCE_ORDER and overwrite col G only for rows that have
+    # content in col D (i.e. the measure was actually included).
+    # Unknown measures keep their numbers from the loop above.
     seq_number = 1
     for group in SEQUENCE_ORDER:
         group_has_content = False
@@ -1320,7 +1040,6 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
                 group_has_content = True
         if group_has_content:
             seq_number += 1
-
 
 # ================================================================
 # MAIN PROCESSING LOOP
