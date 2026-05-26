@@ -1,1 +1,1576 @@
+import os
+import glob
+import re
+import math
+import requests
+import fitz  # PyMuPDF
+import pandas as pd
+from openpyxl import load_workbook
+from tqdm import tqdm
+from copy import copy
+from openpyxl.utils import range_boundaries
+import time
 
+# ================================================================
+# START TIMER
+# ================================================================
+start_time = time.time()
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+FULL_ADDRESS_COL    = "Full Address"
+POSTAL_CODE_COL     = "Postal Code"
+SELECT_MEASURES_COL = "Select Measures"
+
+PROPOSED_SAP_COL = "Proposed Post SAP Score"
+PRE_SAP_COL      = "Pre SAP Score (Full SAP)"
+
+# ── Smartsheet column names for climate risk / property flags ──
+CONSERVATION_AREA_COL = "Conservation Area"
+LISTED_BUILDING_COL   = "Listed Building"
+RADON_RISK_COL        = "Radon Risk"
+FLOOD_RISK_COL        = "Flood Risk"
+SUBS_2030_COL         = "Subsidence 2030"
+SUBS_2070_COL         = "Subsidence 2070"
+WDR_RISK_COL          = "Wind Driven Rain Risk"
+RAINFALL_RISK_COL     = "Rainfall Risk"
+WIND_SPEED_RISK_COL   = "Wind speed Risk"
+WILDFIRE_RISK_COL     = "Wildfire Risk"
+
+SM_URL     = f"https://api.smartsheet.eu/2.0/sheets/{SHEET_ID}"
+SM_HEADERS = {"Authorization": f"Bearer {SS_TOKEN}"}
+# Add your Property Master Smartsheet ID in your config before running.
+# Example: PROPERTY_MASTER_SHEET_ID = 1234567890123456
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+
+# ================================================================
+# CUSTOM ROUND — .5 and above rounds UP, below rounds DOWN
+# ================================================================
+def custom_round(x) -> float:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return x
+    floor_val = math.floor(x)
+    return float(math.ceil(x) if (x - floor_val) >= 0.5 else floor_val)
+
+
+# ================================================================
+# ROOM CLASSIFICATION & SORT
+# ================================================================
+WET_ROOM_KEYWORDS = ["kitchen", "bathroom", "wetroom", "wet room", "wc", "w/c", "toilet", "utility"]
+
+WET_ROOM_PRIORITY = {
+    "kitchen":  0,
+    "utility":  1,
+    "bathroom": 2,
+    "wetroom":  3,
+    "wet room": 3,
+    "wc":       4,
+    "w/c":      4,
+    "toilet":   5,
+}
+
+
+def is_wet_room(room_name: str) -> bool:
+    name = room_name.lower()
+    return any(kw in name for kw in WET_ROOM_KEYWORDS)
+
+
+def is_wc_or_utility(room_name: str) -> bool:
+    name = room_name.lower().strip()
+    return any(kw in name for kw in ["wc", "w/c", "toilet", "utility"])
+
+
+def wet_room_sort_key(room_name: str):
+    name = room_name.lower()
+    for kw, priority in WET_ROOM_PRIORITY.items():
+        if kw in name:
+            return (0, priority)
+    if any(kw in name for kw in ["living", "lounge", "dining", "reception"]):
+        return (1, 0)
+    if "bedroom" in name:
+        return (2, 0)
+    return (3, 0)
+
+
+# ================================================================
+# PDF HELPERS
+# ================================================================
+def read_pdf_text(path):
+    with fitz.open(path) as doc:
+        return "\n".join(page.get_text() for page in doc)
+
+
+def read_pdf_page_lines(path, page_num):
+    with fitz.open(path) as doc:
+        if page_num < 0 or page_num >= len(doc):
+            return []
+        return (doc[page_num].get_text() or "").splitlines()
+
+
+def find_retrofit_folder(base):
+    for entry in os.listdir(base):
+        if "retrofit" in entry.lower():
+            return os.path.join(base, entry)
+    return None
+
+
+# ================================================================
+# PDF CLASSIFICATION (CR / SN / EPR)
+# ================================================================
+def _norm_name(path: str) -> str:
+    base = os.path.splitext(os.path.basename(path))[0].lower()
+    base = re.sub(r"[\(\)\[\]]", " ", base)
+    base = re.sub(r"[^a-z0-9]+", " ", base)
+    return re.sub(r"\s+", " ", base).strip()
+
+
+def _is_ignored_pdf(path: str) -> bool:
+    tokens = set(_norm_name(path).split())
+    return bool(tokens & {"fp", "floorplan", "plan", "xml", "lig"})
+
+
+def _classify_pdf(path: str) -> set:
+    if _is_ignored_pdf(path):
+        return set()
+    name   = _norm_name(path)
+    tokens = set(name.split())
+    types  = set()
+    if "conditionreport" in name.replace(" ", "") or ("condition" in tokens and "report" in tokens) or "cr" in tokens:
+        types.add("CR")
+    if "sn" in tokens:
+        types.add("SN")
+    if "epr" in tokens and "sn" not in tokens:
+        types.add("EPR")
+    return types
+
+
+def get_required_pdfs(retrofit_path: str):
+    pdfs = glob.glob(os.path.join(retrofit_path, "*.pdf"))
+    if not pdfs:
+        return None
+    classified = [(p, _classify_pdf(p)) for p in pdfs]
+    classified = [(p, t) for p, t in classified if t]
+
+    def pick(want):
+        exact   = [p for p, t in classified if t == {want}]
+        partial = [p for p, t in classified if want in t]
+        return (exact or partial or [None])[0]
+
+    cr, sn, epr = pick("CR"), pick("SN"), pick("EPR")
+    return (cr, sn, epr) if (cr and sn and epr) else None
+
+
+# ================================================================
+# ADDRESS EXTRACTION
+# ================================================================
+def extract_property_address_from_cr(path):
+    lines = [l.strip() for l in read_pdf_page_lines(path, 0) if l.strip()]
+    addr_lines = []
+    for i, line in enumerate(lines):
+        if "Property Address" in line:
+            for l in lines[i + 1: i + 7]:
+                if any(x in l.lower() for x in ["assessment", "reference", "date"]):
+                    break
+                addr_lines.append(l)
+            break
+    addr = " ".join(addr_lines)
+    addr = re.sub(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?)\s+(\d[A-Z]{2})\b", r"\1 \2", addr, flags=re.I)
+    return re.sub(r"\s{2,}", " ", addr).strip()
+
+
+def extract_postcode(text):
+    m = re.search(r"[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}", str(text), re.I)
+    return m.group(0).upper() if m else ""
+
+
+def extract_house_number(address):
+    if pd.isna(address):
+        return None
+    address = str(address).strip()
+    m = re.search(r"(?i)(?:flat|apartment)\s+([A-Za-z0-9]{1,5})", address)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([A-Za-z]?\d+[A-Za-z]?)\b", address)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\d+[A-Za-z]?)\b", address)
+    return m.group(1) if m else None
+
+
+def extract_street_number(address, house_number):
+    if not address or not house_number:
+        return None
+    remaining = re.sub(rf"\b{re.escape(str(house_number))}\b", "", address, count=1, flags=re.I)
+    m = re.search(r"\b(\d+[A-Za-z]?)\b", remaining)
+    return m.group(1) if m else None
+
+
+def normalize_text(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(x).lower())
+
+
+def normalize_postcode(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(r"\s+", "", str(x).lower())
+
+
+# ================================================================
+# TENURE NORMALISATION
+# ================================================================
+def normalise_tenure(raw_tenure: str) -> str:
+    if not raw_tenure:
+        return raw_tenure
+    cleaned = raw_tenure.strip()
+    if re.search(r"rent(?:al|ed)\s*\(?\s*social\s*\)?", cleaned, re.I):
+        return "Social Housing"
+    return cleaned
+
+
+# ================================================================
+# EXTRACT PROPERTY DETACHMENT FROM CR PDF PAGE 3
+# ================================================================
+def extract_property_detachment_from_cr(path: str) -> str:
+    lines = read_pdf_page_lines(path, 2)
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith("property detachment"):
+            value = re.sub(r"(?i)property\s+detachment\s*", "", stripped).strip()
+            if value:
+                return value
+    return ""
+
+
+# ================================================================
+# SMARTSHEET
+# ================================================================
+def fetch_smartsheet_df():
+    r = requests.get(SM_URL, headers=SM_HEADERS)
+    r.raise_for_status()
+    sheet   = r.json()
+    col_map = {c["id"]: c["title"] for c in sheet["columns"]}
+    rows    = []
+    for row in sheet["rows"]:
+        d = {col_map[cell["columnId"]]: cell.get("displayValue", "") for cell in row["cells"]}
+        rows.append(d)
+    return pd.DataFrame(rows)
+
+
+# ================================================================
+# PROPERTY MASTER LOOKUP USING PROPERTY ID
+# ================================================================
+PROPERTY_MASTER_ID_COL_OPTIONS = [
+    "Property ID",
+    "Property_ID",
+    "Property Id",
+    "property_id",
+]
+
+PROPERTY_MASTER_RISK_COLS = [
+    CONSERVATION_AREA_COL,
+    LISTED_BUILDING_COL,
+    RADON_RISK_COL,
+    FLOOD_RISK_COL,
+    SUBS_2030_COL,
+    SUBS_2070_COL,
+    WDR_RISK_COL,
+    RAINFALL_RISK_COL,
+    WIND_SPEED_RISK_COL,
+    WILDFIRE_RISK_COL,
+]
+
+
+def normalize_property_id(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(x).strip().lower())
+
+
+def get_first_existing_col(df, possible_cols):
+    for col in possible_cols:
+        if col in df.columns:
+            return col
+    return None
+
+
+def get_safe_value(row, col_name, default=""):
+    if row is None or col_name not in row.index:
+        return default
+    val = row.get(col_name, default)
+    if val is None or pd.isna(val):
+        return default
+    return str(val).strip()
+
+
+def fetch_property_master_df():
+    url = f"https://api.smartsheet.eu/2.0/sheets/{PROPERTY_MASTER_SHEET_ID}"
+    r = requests.get(url, headers=SM_HEADERS)
+    r.raise_for_status()
+    sheet = r.json()
+    col_map = {c["id"]: c["title"] for c in sheet["columns"]}
+    rows = []
+    for row in sheet["rows"]:
+        d = {col_map[cell["columnId"]]: cell.get("displayValue", cell.get("value", "")) for cell in row["cells"]}
+        rows.append(d)
+    return pd.DataFrame(rows)
+
+
+def find_property_master_row(df_master, property_id_value):
+    if df_master is None or df_master.empty:
+        return None
+
+    master_id_col = get_first_existing_col(df_master, PROPERTY_MASTER_ID_COL_OPTIONS)
+    if not master_id_col:
+        raise ValueError(
+            "Property Master sheet does not contain a Property ID column. "
+            "Expected one of: Property ID, Property_ID, Property Id, property_id"
+        )
+
+    target_id = normalize_property_id(property_id_value)
+    if not target_id:
+        return None
+
+    df_master = df_master.copy()
+    df_master["_n_property_id"] = df_master[master_id_col].apply(normalize_property_id)
+    matches = df_master[df_master["_n_property_id"] == target_id]
+
+    if matches.empty:
+        return None
+
+    return matches.iloc[0]
+
+
+# ================================================================
+# COORDINATES
+# ================================================================
+def dms_to_dd(deg, minutes, sec, direction):
+    dd = float(deg) + float(minutes) / 60 + float(sec) / 3600
+    return round(-dd if direction in ["S", "W"] else dd, 5)
+
+
+def extract_lat_lon_from_cr(path):
+    text      = read_pdf_text(path)
+    lat_match = re.search(r"Latitude[: ]\s*(\d+)[° ]\s*(\d+)'?\s*(\d+)''?\s*([NSEW])", text)
+    lon_match = re.search(r"Longitude[: ]\s*(\d+)[° ]\s*(\d+)'?\s*(\d+)''?\s*([NSEW])", text)
+    lat = dms_to_dd(*lat_match.groups()) if lat_match else ""
+    lon = dms_to_dd(*lon_match.groups()) if lon_match else ""
+    return lat, lon
+
+
+# ================================================================
+# EXTRACTION HELPERS
+# ================================================================
+def safe_search(pattern, text, flags=0):
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else ""
+
+
+def extract_date_built_from_sn(path: str) -> str:
+    lines = read_pdf_page_lines(path, 0)
+    for i, line in enumerate(lines):
+        if "Date Built" in line:
+            for l in lines[i: i + 6]:
+                m = re.search(r"(\d{4})\s*[-–]\s*(\d{4})", l)
+                if m:
+                    return f"{m.group(1)}-{m.group(2)}"
+            m2 = re.search(r"(\d{4})\s*[-–]\s*(\d{4})", read_pdf_text(path))
+            if m2:
+                return f"{m2.group(1)} - {m2.group(2)}"
+            break
+    return ""
+
+
+def extract_num_storeys_from_sn(path: str) -> str:
+    lines = read_pdf_page_lines(path, 0)
+    for i, line in enumerate(lines):
+        if "Number of" in line and "Storeys" in " ".join(lines[i: i + 3]):
+            for j in range(i + 1, min(i + 6, len(lines))):
+                m = re.search(r"\b(\d+)\b", lines[j])
+                if m:
+                    return m.group(1)
+            break
+    return ""
+
+
+def extract_exposure_zone_from_cr(path):
+    for line in read_pdf_page_lines(path, 2):
+        if "Exposure" in line and "Zone" in line:
+            m = re.search(r"Zone\s*([A-Za-z]+)", line)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def extract_vulnerable_flag_from_cr(path: str) -> str:
+    lines = read_pdf_page_lines(path, 44)
+    questions = [
+        "How many are children under the age of 18?",
+        "How many of a pensionable age?",
+        "How many with disabilities?"
+    ]
+    values = []
+    for line in lines:
+        s = line.strip()
+        for q in questions:
+            if s.startswith(q):
+                part = s.split("?", 1)[1].strip()
+                values.append(int(part) if part.isdigit() else 0)
+    return "Yes" if any(v > 0 for v in values) else "No"
+
+
+def extract_constraints_and_construction_from_cr(path: str):
+    text   = "\n".join(read_pdf_page_lines(path, 2))
+    m_con  = re.search(r"Property\s+Constraints\s*([^\n\r]+)", text)
+    m_cons = re.search(r"Property\s+Construction\s*([^\n\r]+)", text)
+    constraints_val   = m_con.group(1).strip() if m_con else ""
+    construction_flag = "Yes" if m_cons and m_cons.group(1).strip().lower().startswith("traditional") else "No"
+    return constraints_val, construction_flag
+
+
+def get_building_orientation_direction(path: str) -> str:
+    text = "\n".join(read_pdf_page_lines(path, 2))
+    m = re.search(r"Building\s+Orientation\s*\(degrees\)\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if not m:
+        return ""
+    angle = float(m.group(1))
+    table = [
+        (15, "North"), (45, "North East"), (75, "East"), (105, "East"),
+        (135, "South East"), (165, "South"), (195, "South"), (225, "South West"),
+        (255, "West"), (285, "West"), (315, "North West"), (345, "North"), (360, "North")
+    ]
+    for heading, direction in table:
+        if angle <= heading:
+            return direction
+    return ""
+
+
+def extract_highest_bedroom_from_contents(cr_page2_lines):
+    highest_bedroom     = 0
+    found_plain_bedroom = False
+    for line in cr_page2_lines:
+        m = re.search(r"\bBedroom\s+(\d+)\b", line.strip(), flags=re.IGNORECASE)
+        if m:
+            highest_bedroom = max(highest_bedroom, int(m.group(1)))
+        elif re.search(r"\bBedroom\b", line.strip(), flags=re.IGNORECASE):
+            found_plain_bedroom = True
+    if highest_bedroom == 0 and found_plain_bedroom:
+        highest_bedroom = 1
+    return highest_bedroom
+
+
+# ================================================================
+# ROOM EXTRACTION FROM CONTENTS PAGE
+# — Fully rewritten to be robust against Elmhurst-style PDFs
+#
+# Strategy:
+#   1. Read page 1 (0-indexed) as raw lines.
+#   2. Build a paired list: (item_text, page_number) by matching
+#      lines that are purely numeric to the previous non-numeric line.
+#   3. Drop known non-room entries using a blocklist.
+#   4. Keep only entries that sit between the first recognised room
+#      keyword and the first end-section keyword.
+# ================================================================
+
+# Lines whose text matches these patterns are NEVER rooms
+_NON_ROOM_EXACT = {
+    "contents", "property details", "property summary", "occupancy",
+    "elevations", "elevation", "significance survey", "additional information",
+    "annex", "appendix", "notes", "floor plan", "floorplan",
+}
+
+# If any of these substrings appear in a line it is not a room
+_NON_ROOM_SUBSTRINGS = [
+    "element no", "significance", "elevation", "floorplan", "floor plan",
+    "property detail", "property summary", "additional info", "annex",
+    "appendix", "occupancy",
+]
+
+# Stop collecting rooms once we hit these (case-insensitive substring match)
+_END_SECTION_KEYWORDS = [
+    "occupancy", "significance", "elevation", "additional", "annex",
+    "appendix", "summary", "notes",
+]
+
+# A line is considered a room candidate if it contains at least one of these
+_ROOM_INDICATOR_KEYWORDS = [
+    "kitchen", "bathroom", "bedroom", "living", "lounge", "dining",
+    "hall", "hallway", "wc", "toilet", "utility", "wetroom", "wet room",
+    "study", "office", "conservatory", "landing", "store", "cupboard",
+    "reception", "playroom", "cellar", "loft", "attic", "en suite",
+    "en-suite", "ensuite", "cloakroom",
+]
+
+
+def _is_non_room(text: str) -> bool:
+    """Return True if this line should never be treated as a room."""
+    t = text.strip().lower()
+    if t in _NON_ROOM_EXACT:
+        return True
+    for sub in _NON_ROOM_SUBSTRINGS:
+        if sub in t:
+            return True
+    return False
+
+
+def _is_end_section(text: str) -> bool:
+    t = text.strip().lower()
+    return any(kw in t for kw in _END_SECTION_KEYWORDS)
+
+
+def _looks_like_room(text: str) -> bool:
+    t = text.strip().lower()
+    return any(kw in t for kw in _ROOM_INDICATOR_KEYWORDS)
+
+
+def extract_rooms_from_contents(cr_pdf_path: str) -> list:
+    """
+    Parse the Contents page (PDF page index 1) of an Elmhurst CR PDF
+    and return a list of room names in document order.
+
+    Returns an empty list (never raises) so the caller can decide
+    what to do when no rooms are found.
+    """
+    raw_lines = read_pdf_page_lines(cr_pdf_path, 1)
+
+    # ── Step 1: strip whitespace, drop blank lines and page-header noise ──
+    cleaned = []
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        # Drop lines that are purely "Page N" or "page N"
+        if re.match(r"^page\s+\d+$", s, re.IGNORECASE):
+            continue
+        cleaned.append(s)
+
+    if not cleaned:
+        return []
+
+    # ── Step 2: pair item names with their page numbers ──────────────────
+    # Elmhurst PDFs typically emit: "Room Name\n22\n" or interleaved.
+    # We walk the list; when we see a digit-only token after a text token
+    # we treat (text_token, digit_token) as a (name, page_no) pair.
+    pairs = []   # list of (name_str, page_no_int)
+    i = 0
+    while i < len(cleaned):
+        token = cleaned[i]
+        if token.isdigit():
+            # Orphan page number — try to attach to the previous pair's name
+            # (happens when name and number are on the same visual line but
+            #  the PDF emits them as two tokens)
+            if pairs:
+                # already have a pair; this is just noise — skip
+                pass
+            i += 1
+            continue
+        # Look ahead for a page number
+        if i + 1 < len(cleaned) and cleaned[i + 1].isdigit():
+            pairs.append((token, int(cleaned[i + 1])))
+            i += 2
+        else:
+            # No page number immediately follows; record with page_no=-1
+            pairs.append((token, -1))
+            i += 1
+
+    if not pairs:
+        return []
+
+    # ── Step 3: find the slice of pairs that represent actual rooms ───────
+    # We look for the first pair whose name looks like a room, then collect
+    # until we hit an end-section keyword.
+    start_idx = None
+    for idx, (name, _) in enumerate(pairs):
+        if _is_end_section(name):
+            break
+        if _looks_like_room(name) and not _is_non_room(name):
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        # Fallback: take everything that is not a known non-room and not an
+        # end-section marker, skipping the first two entries (usually
+        # "Property Details" and "Property Summary").
+        print("  ⚠️  No recognised room keyword found; using fallback extraction.")
+        rooms = [
+            name for name, _ in pairs[2:]
+            if not _is_non_room(name) and not _is_end_section(name)
+        ]
+        return rooms
+
+    rooms = []
+    for name, _ in pairs[start_idx:]:
+        if _is_end_section(name):
+            break
+        if _is_non_room(name):
+            continue
+        rooms.append(name)
+
+    # ── Step 4: deduplicate while preserving order ────────────────────────
+    seen  = set()
+    dedup = []
+    for r in rooms:
+        key = r.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            dedup.append(r)
+
+    dedup = [
+        r for r in dedup
+        if not re.search(r"^page\s+\d+\s+of\s+\d+$", str(r).strip(), re.I)
+    ]
+
+    return dedup
+
+
+# ================================================================
+# ROOM EXTRACTION QUESTIONS
+# ================================================================
+Q_CONDENSATION = "Is there any evidence of condensation, damp or mould growth in this room?"
+Q_BG_AREA      = "Background Ventilation Area (mm2)"
+Q_TRICKLE      = "Do they have trickle vents?"
+Q_UNDERCUTS    = "Are the undercuts on all the internal doors"
+Q_WINDOWS      = "Does the room have any windows?"
+Q_FANS         = "Does the room have fans fitted?"
+
+
+def extract_yes_no_strict(lines, question):
+    for line in lines:
+        if line.startswith(question):
+            parts = line.split("?", 1)
+            if len(parts) == 2 and parts[1].strip() in ("Yes", "No"):
+                return parts[1].strip()
+            return None
+    return None
+
+
+def extract_mm2_strict(lines):
+    for line in lines:
+        if line.startswith(Q_BG_AREA):
+            tail = line.replace(Q_BG_AREA, "").strip()
+            return tail if tail.isdigit() else None
+    return None
+
+
+def clean_lines(lines):
+    return [l.strip() for l in lines if l.strip() and not l.strip().lower().startswith("page ")]
+
+
+def get_room_page_range(contents, room):
+    try:
+        idx = contents.index(room)
+    except ValueError:
+        return None, None
+
+    start_page = None
+
+    # Find first page number after room name
+    for i in range(idx + 1, len(contents)):
+        if str(contents[i]).strip().isdigit():
+            start_page = int(str(contents[i]).strip())
+            break
+
+    if start_page is None:
+        return None, None
+
+    next_page = None
+
+    # Find next page number after start page
+    for j in range(i + 1, len(contents)):
+        if str(contents[j]).strip().isdigit():
+            next_page = int(str(contents[j]).strip())
+            break
+
+    if next_page is None:
+        return start_page - 1, start_page + 2
+
+    return start_page - 1, next_page - 2
+
+
+def extract_room_data(cr_pdf_path, contents, room):
+    empty = {"condensation": None, "background": None, "trickle": None,
+             "undercuts": None, "windows": None, "fans": None}
+    start_idx, end_idx = get_room_page_range(contents, room)
+    if start_idx is None:
+        return empty
+    all_lines = []
+    try:
+        for p in range(start_idx, end_idx + 1):
+            all_lines.extend(read_pdf_page_lines(cr_pdf_path, p))
+    except Exception:
+        return empty
+    lines = clean_lines(all_lines)
+    return {
+        "condensation": extract_yes_no_strict(lines, Q_CONDENSATION),
+        "background":   extract_mm2_strict(lines),
+        "trickle":      extract_yes_no_strict(lines, Q_TRICKLE),
+        "undercuts":    extract_yes_no_strict(lines, Q_UNDERCUTS),
+        "windows":      extract_yes_no_strict(lines, Q_WINDOWS),
+        "fans":         extract_yes_no_strict(lines, Q_FANS),
+    }
+
+
+# ================================================================
+# FLOW RATE HELPERS
+# ================================================================
+def get_min_lps_for_room(room_name: str) -> str:
+    name = room_name.lower()
+    if "kitchen" in name:                                        return "60 l/s minimum"
+    if "bathroom" in name or "wetroom" in name:                  return "15 l/s minimum"
+    if "wc" in name or "toilet" in name or "w/c" in name:       return "6 l/s minimum"
+    if "utility" in name:                                        return "30 l/s minimum"
+    return "N/A"
+
+
+def get_min_lps_for_room_q(room_name: str) -> str:
+    name = room_name.lower()
+    if "kitchen" in name:                                        return "13 l/s minimum"
+    if "bathroom" in name or "wetroom" in name:                  return "8 l/s minimum"
+    if "wc" in name or "toilet" in name or "w/c" in name:       return "6 l/s minimum"
+    if "utility" in name:                                        return "6 l/s minimum"
+    return "N/A"
+
+
+def extract_lps_number(value) -> int:
+    if not value:
+        return 0
+    if isinstance(value, str) and "l/s" in value:
+        try:
+            return int(value.split()[0])
+        except ValueError:
+            return 0
+    return 0
+
+
+# ================================================================
+# EXCEL HELPERS
+# ================================================================
+def find_row_by_label(ws, label, col="A"):
+    for r in range(1, ws.max_row + 1):
+        val = ws[f"{col}{r}"].value
+        if isinstance(val, str) and val.strip() == label:
+            return r
+    raise ValueError(f"Row with label '{label}' not found")
+
+
+def parse_area_m2(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        num = "".join(ch for ch in value if ch.isdigit() or ch == ".")
+        return float(num) if num else 0.0
+    return 0.0
+
+
+def get_master_cell(ws, cell_ref):
+    for merged in ws.merged_cells.ranges:
+        if cell_ref in merged:
+            return merged.coord.split(":")[0]
+    return cell_ref
+
+
+def unmerge_in_range(ws, start_row):
+    affected = []
+    for m in list(ws.merged_cells.ranges):
+        c1, r1, c2, r2 = range_boundaries(str(m))
+        if r1 >= start_row:
+            affected.append((c1, r1, c2, r2))
+            ws.unmerge_cells(str(m))
+    return affected
+
+
+def remerge(ws, ranges):
+    for c1, r1, c2, r2 in ranges:
+        ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
+
+
+# ================================================================
+# WRITE ROOM ROW
+# ================================================================
+def write_room_row(ws, row, d, room):
+    def v(x):
+        return x if x is not None else "Not Extracted"
+
+    room_lower = room.lower()
+    bg_value   = d["background"]
+    fans_value = v(d["fans"])
+
+    wet_room_keys = ["kitchen", "bathroom", "wetroom", "wet room", "wc", "w/c", "toilet", "utility"]
+    is_wet        = any(w in room_lower for w in wet_room_keys)
+
+    # Col B: condensation / trickle check
+    if is_wc_or_utility(room):
+        ws[f"B{row}"].value = "No minimum"
+    else:
+        ws[f"B{row}"].value = v(d["condensation"])
+
+    # Col C: required background vent size
+    if bg_value is None:
+        ws[f"C{row}"].value = "No"
+    elif "bathroom" in room_lower or "wetroom" in room_lower:
+        ws[f"C{row}"].value = "4000mm2"
+    else:
+        ws[f"C{row}"].value = "8000mm2"
+
+    # Col D: actual measured background vent
+    ws[f"D{row}"].value = "No" if bg_value is None else f"{bg_value}mm2"
+
+    # Col E, F: undercuts and windows
+    ws[f"E{row}"].value = v(d["undercuts"])
+    ws[f"F{row}"].value = v(d["windows"])
+
+    # Col G: IEV/fan status
+    if is_wet:
+        ws[f"G{row}"].value = "IEV Present" if fans_value == "Yes" else "None"
+    else:
+        ws[f"G{row}"].value = "N/A"
+
+    # Col H: minimum boost l/s
+    ws[f"H{row}"].value = get_min_lps_for_room(room)
+
+    # Col K: mould clean recommendation
+    cond_val = d["condensation"]
+    ws[f"K{row}"].value = (
+        "No"    if cond_val == "No"  else
+        "Clean" if cond_val == "Yes" else
+        "Not Extracted"
+    )
+
+    # Col L: trickle vent required size (dry rooms only)
+    ws[f"L{row}"].value = "N/A" if is_wet else "4000mm2"
+
+    # Col M: trickle/sealing works
+    col_c_val     = ws[f"C{row}"].value
+    undercuts_val = ws[f"E{row}"].value
+    if is_wet:
+        ws[f"M{row}"].value = "Sealed" if fans_value == "Yes" else "No Works"
+    else:
+        ws[f"M{row}"].value = (
+            "Required" if col_c_val == "No" and undercuts_val == "Yes" else "No Works"
+        )
+
+    # Col N: door undercut works
+    ws[f"N{row}"].value = (
+        "Required"      if d["undercuts"] == "No"  else
+        "No Works"      if d["undercuts"] == "Yes" else
+        "Not Extracted"
+    )
+
+    # Col O: window works
+    ws[f"O{row}"].value = (
+        "Required"      if d["windows"] == "No"  else
+        "No Works"      if d["windows"] == "Yes" else
+        "Not Extracted"
+    )
+
+    # Col P: fan/dMEV works
+    if is_wet:
+        ws[f"P{row}"].value = "Upgrade dMEV" if fans_value == "Yes" else "Install dMEV"
+    else:
+        ws[f"P{row}"].value = "N/A"
+
+    # Col Q: minimum quiet l/s
+    ws[f"Q{row}"].value = get_min_lps_for_room_q(room)
+
+    # Col R: placeholder
+    ws[f"R{row}"].value = "Information Unavailable"
+
+
+# ================================================================
+# MAIN ROOM INSERTION (Sheet 11.0)
+# — Uses the new robust extract_rooms_from_contents()
+# ================================================================
+def insert_rooms_with_template(
+    cr_pdf_path,
+    workbook,
+    sheet_name="11.0",
+    insert_at_row=5,
+    template_row=4,
+    room_col_left="A",
+    room_col_right="J",
+    tfa=None,
+    highest_bedroom=0
+):
+    ws = workbook[sheet_name]
+
+    # ── Keep the raw contents lines exactly like the old code ─────
+    contents_raw = read_pdf_page_lines(cr_pdf_path, 1)
+
+    # ── Build room list using the same old-code process ───────────
+    cleaned = []
+    for x in contents_raw:
+        x = x.strip()
+        if not x or x.isdigit():
+            continue
+        if x.lower().startswith("page"):
+            continue
+        if x.lower() in ("contents", "property details"):
+            continue
+        cleaned.append(x)
+
+    possible_starts = [
+        "Kitchen", "Kitchen & storage", "Kitchen and Storage",
+        "Living Room", "Lounge", "Dining Room", "Dining",
+        "Bedroom", "Bedroom 1", "Hall", "Hallway",
+        "Bathroom", "WC", "w/c", "Toilet", "Utility"
+    ]
+
+    start_idx = 0
+    for i, item in enumerate(cleaned):
+        if any(s.lower() in item.lower() for s in possible_starts):
+            start_idx = i
+            break
+
+    end_markers = ["occupancy", "additional", "summary", "recommendations", "annex", "appendix"]
+    end_idx = next(
+        (i for i, item in enumerate(cleaned) if any(m in item.lower() for m in end_markers)),
+        len(cleaned)
+    )
+
+    rooms = cleaned[start_idx:end_idx]
+    non_room_keywords = ["elevation", "floorplan", "floor plan", "summary",
+                         "additional information", "annex", "appendix", "notes"]
+    rooms = [r for r in rooms if not any(kw in r.lower() for kw in non_room_keywords)]
+
+    if not rooms:
+        raise ValueError("No rooms found in Contents page")
+
+    rooms = sorted(rooms, key=wet_room_sort_key)
+    print(f"  📋 Found {len(rooms)} rooms (sorted): {rooms}")
+
+    original_heights = {r: d.height for r, d in ws.row_dimensions.items() if d.height is not None}
+    affected_merges  = unmerge_in_range(ws, insert_at_row)
+    ws.insert_rows(insert_at_row, amount=len(rooms))
+
+    for r, h in original_heights.items():
+        ws.row_dimensions[r + len(rooms) if r >= insert_at_row else r].height = h
+
+    tpl_height = ws.row_dimensions[template_row].height
+    for i in range(len(rooms)):
+        ws.row_dimensions[insert_at_row + i].height = tpl_height
+        for c in range(1, ws.max_column + 1):
+            ws.cell(insert_at_row + i, c)._style = copy(ws.cell(template_row, c)._style)
+
+    for i, room in enumerate(rooms):
+        row  = insert_at_row + i
+        ws[f"{room_col_left}{row}"].value = room
+        ws[f"{room_col_right}{row}"].value = room
+        data = extract_room_data(cr_pdf_path, contents_raw, room)
+        write_room_row(ws, row, data, room)
+        found = " ".join(f"{k}={v}" for k, v in data.items() if v is not None)
+        print(f"    ✓ {room}: {found or 'No questions found'}")
+
+    ws4        = workbook["4.0"]
+    room_start = insert_at_row
+    room_end   = insert_at_row + len(rooms) - 1
+
+    ws4["H5"].value = (
+        "Yes" if any(ws[f"P{r}"].value == "Upgrade dMEV" for r in range(room_start, room_end + 1))
+        else "No"
+    )
+    ws4["B8"].value = (
+        "Yes" if any(ws[f"B{r}"].value == "Yes" for r in range(room_start, room_end + 1))
+        else "No"
+    )
+
+    total_lps_h = sum(extract_lps_number(ws[f"H{insert_at_row + i}"].value) for i in range(len(rooms)))
+    total_lps_q = sum(extract_lps_number(ws[f"Q{insert_at_row + i}"].value) for i in range(len(rooms)))
+    total_row   = insert_at_row + len(rooms) + 1
+    ws[f"H{total_row}"].value = f"{total_lps_h} l/s"
+    ws[f"Q{total_row}"].value = f"{total_lps_q} l/s"
+
+    floor_area_row = find_row_by_label(ws, "Whole building ventilation rate (l/s) - floor area (m2)", col="A")
+    ws[f"G{floor_area_row}"].value = tfa
+    ws[f"P{floor_area_row}"].value = tfa
+
+    floor_rate = custom_round(parse_area_m2(tfa) * 0.3)
+    ws[f"H{floor_area_row}"].value = f"{floor_rate} l/s"
+    ws[f"Q{floor_area_row}"].value = f"{floor_rate} l/s"
+
+    bedroom_row = find_row_by_label(ws, "Whole building ventilation rate (l/s) - bedrooms", col="A")
+    ws[f"G{bedroom_row}"].value = f"{highest_bedroom} bed"
+    ws[f"P{bedroom_row}"].value = f"{highest_bedroom} bed"
+    bed_rate_raw = {1: 19, 2: 25, 3: 31, 4: 37, 5: 43}.get(highest_bedroom, 0)
+    bed_rate     = custom_round(bed_rate_raw)
+    ws[f"H{bedroom_row}"].value = f"{bed_rate} l/s"
+    ws[f"Q{bedroom_row}"].value = f"{bed_rate} l/s"
+
+    final_row    = find_row_by_label(ws, "Whole building ventilation rate - final", col="A")
+    final_rate_h = custom_round(max(floor_rate, bed_rate, total_lps_h))
+    final_rate_q = custom_round(max(floor_rate, bed_rate, total_lps_q))
+    ws[f"H{final_row}"].value = f"{final_rate_h} l/s"
+    ws[f"Q{final_row}"].value = f"{final_rate_q} l/s"
+
+    remerge(ws, [(c1, r1 + len(rooms), c2, r2 + len(rooms)) for c1, r1, c2, r2 in affected_merges])
+
+    return rooms
+
+
+# ================================================================
+# WRITE SHEET 4.0
+# ================================================================
+def write_sheet_4_base(ws, wb_data: dict):
+    d = wb_data
+    ws[get_master_cell(ws, "B3")]  = d["dwelling_address"]
+    ws[get_master_cell(ws, "B4")]  = d["property_id_value"]
+    ws[get_master_cell(ws, "B5")]  = d["local_authority_name"]
+    ws[get_master_cell(ws, "B6")]  = d["sap_current"]
+    ws[get_master_cell(ws, "E3")]  = d["sap_current"]
+    ws[get_master_cell(ws, "E9")]  = d["sap_potential"]
+    ws[get_master_cell(ws, "B7")]  = d["tenure"]
+    ws[get_master_cell(ws, "B14")] = d["date_built"]
+    ws[get_master_cell(ws, "B15")] = d["wall_type"]
+    ws[get_master_cell(ws, "B16")] = d["property_type"]
+    ws[get_master_cell(ws, "B17")] = d["num_storeys"]
+    ws[get_master_cell(ws, "B18")] = d["highest_bedroom"] if d["highest_bedroom"] > 0 else ""
+    ws[get_master_cell(ws, "B19")] = d["exposure_zone"]
+    ws[get_master_cell(ws, "B20")] = d["property_construction_flag"]
+    ws[get_master_cell(ws, "B21")] = d["conservation_flag"]
+    ws[get_master_cell(ws, "B22")] = "No"
+    ws[get_master_cell(ws, "B24")] = d["property_constraints_val"]
+    ws[get_master_cell(ws, "B25")] = d["vulnerable_flag"]
+    ws[get_master_cell(ws, "E4")]  = d["tfa_sqm"]
+    ws[get_master_cell(ws, "E10")] = d["tfa_sqm"]
+    ws[get_master_cell(ws, "E5")]  = d["extra1_last"]
+    ws[get_master_cell(ws, "E6")]  = d["extra1"]
+    ws[get_master_cell(ws, "E11")] = d["extra2_last"]
+    ws[get_master_cell(ws, "E12")] = d["extra2"]
+
+    conservation = d.get("conservation_flag", "No")
+    if str(conservation).strip().lower() == "yes":
+        ws[get_master_cell(ws, "B10")] = "TBC"
+        ws[get_master_cell(ws, "B11")] = "Pending"
+        ws[get_master_cell(ws, "B12")] = "TBC"
+        ws[get_master_cell(ws, "B13")] = "Pending"
+    else:
+        ws[get_master_cell(ws, "B10")] = "No"
+        ws[get_master_cell(ws, "B11")] = "No"
+        ws[get_master_cell(ws, "B12")] = "No"
+        ws[get_master_cell(ws, "B13")] = "No"
+
+
+def write_sheet_4_climate_risk(ws, wb_data: dict):
+    d = wb_data
+    ws[get_master_cell(ws, "E16")] = d["radon_risk"]
+    ws[get_master_cell(ws, "E17")] = d["flood_risk"]
+    ws[get_master_cell(ws, "E18")] = d["subs2030"]
+    ws[get_master_cell(ws, "E19")] = d["subs2070"]
+    ws[get_master_cell(ws, "E20")] = d["wdr_risk"]
+    ws[get_master_cell(ws, "E21")] = d["rainfall_risk"]
+    ws[get_master_cell(ws, "E22")] = d["wind_speed_risk"]
+    ws[get_master_cell(ws, "E23")] = d["wildfire_risk"]
+
+
+# ================================================================
+# WRITE SHEET 10.0
+# ================================================================
+def write_sheet_10(workbook):
+    if "10.0" not in workbook.sheetnames:
+        print("⚠️  Sheet '10.0' not found — skipping.")
+        return
+    ws = workbook["10.0"]
+    ws[get_master_cell(ws, "B3")] = SHEET10_B3_VALUE
+    ws[get_master_cell(ws, "F3")] = SHEET10_F3_VALUE
+    print(f"  ✓ Sheet 10.0: B3='{SHEET10_B3_VALUE}', F3='{SHEET10_F3_VALUE}'")
+
+
+# ================================================================
+# WRITE SHEET 7.0
+# ================================================================
+def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_direction, ws4):
+
+    measure_to_cell = {
+        "Trickle Vents":       "A2",
+        "Door undercuts":      "A4",
+        "dMEV":                "A3",
+        "LI (B9)":             "A5",
+        "CWI":                 "A6",
+        "EWI":                 "A7",
+        "IWI":                 "A8",
+        "UFI":                 "A9",
+        "FRI":                 "A10",
+        "RiR and/or Skeiling": "A11",
+        "Windows":             "A12",
+        "Doors":               "A13",
+        "Boiler/FTCH":         "A17",
+        "ESH":                 "A18",
+        "ASHP":                "A19",
+        "GSHP":                "A20",
+        "Solar Thermal":       "A21",
+        "SPV":                 "A22",
+    }
+
+    abbrev_map = {
+        "Trickle Vents":       "TV",
+        "dMEV":                "dMEV",
+        "Door undercuts":      "DRU",
+        "LI (B9)":             "LI",
+        "CWI":                 "CWI",
+        "EWI":                 "EWI",
+        "IWI":                 "IWI",
+        "UFI":                 "UFI",
+        "FRI":                 "FRI",
+        "RiR and/or Skeiling": "RiR/SKI",
+        "Windows":             "Windows",
+        "Doors":               "Doors",
+        "Boiler/FTCH":         "BLR",
+        "ESH":                 "ESH",
+        "ASHP":                "ASHP",
+        "GSHP":                "GSHP",
+        "Solar Thermal":       "ST",
+        "SPV":                 "SPV",
+        "LEL":                 "LEL",
+        "HWC":                 "HWC",
+        "Draught-Proofing":    "DPRF",
+        "Upgrade boiler, same fuel":                    "UBLR",
+        "Heat Recovery System for Mixer Showers":       "HRSMS",
+    }
+
+    SEQUENCE_ORDER = [
+        ["dMEV"],
+        ["CWI"],
+        ["EWI"],
+        ["IWI"],
+        ["LI (B9)"],
+        ["FRI"],
+        ["RiR and/or Skeiling"],
+        ["Windows", "Doors"],
+        ["Boiler/FTCH"],
+        ["ESH"],
+        ["ASHP"],
+        ["GSHP"],
+        ["Solar Thermal"],
+        ["HWC"],
+        ["LEL"],
+        ["SPV"],
+    ]
+
+    # Pre-build sequence lookup
+    measure_seq_lookup = {}
+    _seq = 1
+    for group in SEQUENCE_ORDER:
+        for name in group:
+            measure_seq_lookup[name] = _seq
+        _seq += 1
+    next_unknown_seq = _seq
+
+    def get_spec(abbr: str) -> str:
+        if df_specs.empty or "Abbreviation" not in df_specs.columns:
+            return ""
+        spec_row = df_specs[df_specs["Abbreviation"] == abbr]
+        if spec_row.empty:
+            return ""
+        r = spec_row.iloc[0]
+        return (
+            r.get("Construction Design Specification Notes")
+            or r.get("Client Specification")
+            or r.get("Design Specification Notes", "")
+            or ""
+        )
+
+    def find_empty_d_row():
+        for r in range(17, 23):
+            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
+                return r
+        for r in range(2, 15):
+            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
+                return r
+        return None
+
+    measures_list = [m.strip() for m in selected_measures.split(",") if m.strip()]
+    spv_included  = False
+
+    for measure in measures_list:
+        matched_key = None
+        for key in measure_to_cell:
+            if key.lower() in measure.lower():
+                matched_key = key
+                break
+
+        if matched_key == "SPV":
+            spv_included = True
+
+        if matched_key is not None:
+            row_num = int(measure_to_cell[matched_key][1:])
+            abbr    = abbrev_map.get(matched_key, "")
+            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
+            seq = measure_seq_lookup.get(matched_key, next_unknown_seq)
+            ws[get_master_cell(ws, f"G{row_num}")] = seq
+            print(f"  ✓ Known measure '{matched_key}' → row {row_num}, seq {seq}")
+        else:
+            row_num = find_empty_d_row()
+            if row_num is None:
+                print(f"  ⚠️  No empty row found for '{measure}' — skipped")
+                continue
+
+            b_master = get_master_cell(ws, f"B{row_num}")
+            for merged in list(ws.merged_cells.ranges):
+                c1, r1, c2, r2 = range_boundaries(str(merged))
+                if r1 <= row_num <= r2 and c1 <= 2 <= c2:
+                    ws.unmerge_cells(str(merged))
+                    break
+            ws[b_master] = measure
+
+            abbr     = abbrev_map.get(measure, measure[:4].upper())
+            c_master = get_master_cell(ws, f"C{row_num}")
+            for merged in list(ws.merged_cells.ranges):
+                c1, r1, c2, r2 = range_boundaries(str(merged))
+                if r1 <= row_num <= r2 and c1 <= 3 <= c2:
+                    ws.unmerge_cells(str(merged))
+                    break
+            ws[c_master] = abbr
+            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
+            ws[get_master_cell(ws, f"G{row_num}")] = next_unknown_seq
+            ws[get_master_cell(ws, f"H{row_num}")] = "Minor"
+            print(f"  ℹ️  Unknown measure '{measure}' → row {row_num}, seq {next_unknown_seq}")
+            next_unknown_seq += 1
+
+    if spv_included:
+        if orientation_direction:
+            ws[get_master_cell(ws, "F22")] = orientation_direction
+        ws[get_master_cell(ws, "F23")] = "None or little"
+        print(f"  ✓ SPV included → F22='{orientation_direction}', F23='None or little'")
+    else:
+        ws[get_master_cell(ws, "F22")] = None
+        ws[get_master_cell(ws, "F23")] = None
+
+    condition_met = any(
+        ws[get_master_cell(ws, cell)].value not in (None, False, "", "FALSE")
+        for cell in ["A5", "A6", "A7", "A8", "A10", "A12", "A13"]
+    )
+    ws4["H3"].value = "Yes" if condition_met else "No"
+    ws4["H4"].value = "Yes" if condition_met else "No"
+
+    seq_number = 1
+    for group in SEQUENCE_ORDER:
+        group_has_content = False
+        for measure_name in group:
+            if measure_name not in measure_to_cell:
+                continue
+            row_num = int(measure_to_cell[measure_name][1:])
+            if ws[get_master_cell(ws, f"D{row_num}")].value not in (None, ""):
+                ws[get_master_cell(ws, f"G{row_num}")] = seq_number
+                group_has_content = True
+        if group_has_content:
+            seq_number += 1
+
+
+# ================================================================
+# MAIN PROCESSING LOOP
+# ================================================================
+property_folders = [
+    os.path.join(PARENT_FOLDER, f)
+    for f in os.listdir(PARENT_FOLDER)
+    if os.path.isdir(os.path.join(PARENT_FOLDER, f))
+]
+
+for prop_path in tqdm(property_folders, desc="Processing properties", unit="property"):
+    prop_name = os.path.basename(prop_path)
+
+    try:
+        # ── Locate PDFs ───────────────────────────────────────────
+        retrofit = find_retrofit_folder(prop_path)
+        if not retrofit:
+            print(f"⏭️  Skipped {prop_name} – no Retrofit folder")
+            continue
+
+        pdfs = get_required_pdfs(retrofit)
+        if not pdfs:
+            print(f"⏭️  Skipped {prop_name} – missing CR/SN/EPR")
+            continue
+
+        cr_pdf, sn_pdf, epr_pdf = pdfs
+        sn_text  = read_pdf_text(sn_pdf)
+        epr_text = read_pdf_text(epr_pdf)
+
+        # ── Address matching ──────────────────────────────────────
+        dwelling_address = extract_property_address_from_cr(cr_pdf)
+
+        df1 = pd.DataFrame({"Address": [dwelling_address]})
+        df1["Postcode"]      = df1["Address"].apply(extract_postcode)
+        df1["house_number"]  = df1["Address"].apply(extract_house_number)
+        df1["street_number"] = df1.apply(lambda r: extract_street_number(r["Address"], r["house_number"]), axis=1)
+        df1["n_postcode"]    = df1["Postcode"].apply(normalize_postcode)
+        df1["n_house"]       = df1["house_number"].apply(normalize_text)
+        df1["n_street"]      = df1["street_number"].apply(normalize_text)
+
+        df2 = fetch_smartsheet_df()
+        df2.rename(columns={
+            FULL_ADDRESS_COL:    "Address",
+            POSTAL_CODE_COL:     "PostalCode",
+            SELECT_MEASURES_COL: "Selected_Measures"
+        }, inplace=True)
+
+        df2["Address"] = df2.apply(
+            lambda r: r["Address"] if extract_postcode(r["Address"]) else f'{r["Address"]}, {r["PostalCode"]}',
+            axis=1
+        )
+        df2["Postcode"]      = df2["Address"].apply(extract_postcode)
+        df2["house_number"]  = df2["Address"].apply(extract_house_number)
+        df2["street_number"] = df2.apply(lambda r: extract_street_number(r["Address"], r["house_number"]), axis=1)
+        df2["n_postcode"]    = df2["Postcode"].apply(normalize_postcode)
+        df2["n_house"]       = df2["house_number"].apply(normalize_text)
+        df2["n_street"]      = df2["street_number"].apply(normalize_text)
+
+        matched_row = None
+        for _, row in df2[df2["n_postcode"] == df1.loc[0, "n_postcode"]].iterrows():
+            if row["n_house"] == df1.loc[0, "n_house"] and row["n_street"] == df1.loc[0, "n_street"]:
+                matched_row = row
+                break
+
+        if matched_row is None:
+            print(f"⚠️  {prop_name} – No address match found")
+            matched_address   = ""
+            selected_measures = ""
+            property_id_value = ""
+            sap_potential     = ""
+            sap_current       = ""
+            # ── No match → climate risk / flag values from Smartsheet are empty ──
+            conservation_flag = ""
+            listed_building   = ""
+            radon_risk        = ""
+            flood_risk        = ""
+            subs2030          = ""
+            subs2070          = ""
+            wdr_risk          = ""
+            rainfall_risk     = ""
+            wind_speed_risk   = ""
+            wildfire_risk     = ""
+        else:
+            print(f"✅ {prop_name} – ADDRESS MATCH")
+            matched_address   = matched_row["Address"]
+            selected_measures = matched_row["Selected_Measures"]
+            property_id_value = matched_row.get("Property ID", "")
+            sap_potential     = matched_row.get(PROPOSED_SAP_COL, "")
+            sap_current       = matched_row.get(PRE_SAP_COL, "")
+
+            print(f"🏷️  {prop_name} – Property ID from IOE sheet: {property_id_value}")
+
+        # ── Property Master risk lookup using Property ID ─────────
+        if property_id_value:
+            print(f"🔗 {prop_name} – Fetching Property Master Smartsheet")
+            df_master = fetch_property_master_df()
+            master_row = find_property_master_row(df_master, property_id_value)
+
+            if master_row is None:
+                print(f"⚠️  {prop_name} – No Property Master match found for Property ID: {property_id_value}")
+                conservation_flag = ""
+                listed_building   = ""
+                radon_risk        = ""
+                flood_risk        = ""
+                subs2030          = ""
+                subs2070          = ""
+                wdr_risk          = ""
+                rainfall_risk     = ""
+                wind_speed_risk   = ""
+                wildfire_risk     = ""
+            else:
+                print(f"✅ {prop_name} – Property Master match found for Property ID: {property_id_value}")
+                conservation_flag = get_safe_value(master_row, CONSERVATION_AREA_COL)
+                listed_building   = get_safe_value(master_row, LISTED_BUILDING_COL)
+                radon_risk        = get_safe_value(master_row, RADON_RISK_COL)
+
+                flood_risk_raw = get_safe_value(master_row, FLOOD_RISK_COL)
+                flood_risk = "No" if flood_risk_raw == "" else flood_risk_raw
+
+                subs2030        = get_safe_value(master_row, SUBS_2030_COL)
+                subs2070        = get_safe_value(master_row, SUBS_2070_COL)
+                wdr_risk        = get_safe_value(master_row, WDR_RISK_COL)
+                rainfall_risk   = get_safe_value(master_row, RAINFALL_RISK_COL)
+                wind_speed_risk = get_safe_value(master_row, WIND_SPEED_RISK_COL)
+                wildfire_risk   = get_safe_value(master_row, WILDFIRE_RISK_COL)
+
+                print(
+                    f"🌍 {prop_name} – Property Master risks → "
+                    f"Conservation: {conservation_flag} | "
+                    f"Listed: {listed_building} | "
+                    f"Radon: {radon_risk} | "
+                    f"Flood: {flood_risk}"
+                )
+        else:
+            print(f"⚠️  {prop_name} – Property Master lookup skipped because Property ID is missing")
+            conservation_flag = ""
+            listed_building   = ""
+            radon_risk        = ""
+            flood_risk        = ""
+            subs2030          = ""
+            subs2070          = ""
+            wdr_risk          = ""
+            rainfall_risk     = ""
+            wind_speed_risk   = ""
+            wildfire_risk     = ""
+
+        # ── Coordinates ───────────────────────────────────────────
+        latitude, longitude = extract_lat_lon_from_cr(cr_pdf)
+        if latitude == "" or longitude == "":
+            raise ValueError("Latitude/Longitude not found in CR PDF.")
+
+        # ── EPR additional ratings ────────────────────────────────
+        epr_lines = epr_text.splitlines()
+        nums      = []
+        capture   = False
+        for line in epr_lines:
+            if "Additional ratings for your home" in line:
+                capture = True
+                continue
+            if capture:
+                lc = line.strip()
+                if not lc or "office use only" in lc.lower():
+                    break
+                m = re.search(r"\d+(\.\d+)?", lc)
+                if m:
+                    nums.append(m.group(0))
+                if len(nums) >= 10:
+                    break
+
+        if len(nums) >= 10:
+            extra1      = custom_round(float(nums[0]))
+            extra2      = custom_round(float(nums[1]))
+            extra1_last = custom_round(float(nums[-2]))
+            extra2_last = custom_round(float(nums[-1]))
+        else:
+            extra1 = extra2 = extra1_last = extra2_last = ""
+
+        # ── SN page 1 data ────────────────────────────────────────
+        sn_page1_text = "\n".join(read_pdf_page_lines(sn_pdf, 0))
+        m_tenure      = re.search(r"Property\s+Tenure:\s*([^\n\r]+)", sn_page1_text)
+        raw_tenure    = m_tenure.group(1).strip() if m_tenure else ""
+        tenure        = normalise_tenure(raw_tenure)
+
+        date_built    = extract_date_built_from_sn(sn_pdf)
+        num_storeys   = extract_num_storeys_from_sn(sn_pdf)
+        wall_type     = safe_search(r"Type\s+[A-Z]+\s+(.*)", sn_text)
+        property_type = extract_property_detachment_from_cr(cr_pdf)
+        hab_rooms     = safe_search(r"Habitable Rooms:\s*(\d+)", sn_text)
+        exposure_zone = extract_exposure_zone_from_cr(cr_pdf)
+
+        tfa = safe_search(r"Total Floor Area\s*([\d\.]+\s*m²?)", epr_text)
+        if tfa:
+            tfa = tfa.replace("m²", "m2")
+
+        vulnerable_flag                                       = extract_vulnerable_flag_from_cr(cr_pdf)
+        property_constraints_val, property_construction_flag  = extract_constraints_and_construction_from_cr(cr_pdf)
+        orientation_direction                                 = get_building_orientation_direction(cr_pdf)
+
+        # ── Bedroom count ─────────────────────────────────────────
+        highest_bedroom = extract_highest_bedroom_from_contents(read_pdf_page_lines(cr_pdf, 1))
+
+        # ── Fetch client spec sheet ───────────────────────────────
+        resp2    = requests.get(f"https://api.smartsheet.eu/2.0/sheets/{SECOND_SHEET_ID}", headers=SM_HEADERS)
+        resp2.raise_for_status()
+        sheet2   = resp2.json()
+        col_map2 = {c["id"]: c["title"] for c in sheet2["columns"]}
+        rows2    = []
+        for r2 in sheet2["rows"]:
+            rows2.append({col_map2.get(c["columnId"], ""): c.get("displayValue", c.get("value", "")) for c in r2["cells"]})
+        df_specs = pd.DataFrame(rows2)
+
+        # ── Bundle all extracted data ─────────────────────────────
+        wb_data = {
+            "dwelling_address":           dwelling_address,
+            "property_id_value":          property_id_value,
+            "local_authority_name":       static_local_authority,
+            "sap_current":                sap_current,
+            "sap_potential":              sap_potential,
+            "tenure":                     tenure,
+            "date_built":                 date_built,
+            "wall_type":                  wall_type,
+            "property_type":              property_type,
+            "num_storeys":                num_storeys,
+            "highest_bedroom":            highest_bedroom,
+            "exposure_zone":              exposure_zone,
+            "property_construction_flag": property_construction_flag,
+            "conservation_flag":          conservation_flag,
+            "listed_building":            listed_building,
+            "property_constraints_val":   property_constraints_val,
+            "vulnerable_flag":            vulnerable_flag,
+            "tfa_sqm":                    tfa.replace("m", "sqm") if tfa else "",
+            "extra1":                     extra1,
+            "extra2":                     extra2,
+            "extra1_last":                extra1_last,
+            "extra2_last":                extra2_last,
+            "radon_risk":                 radon_risk,
+            "flood_risk":                 flood_risk,
+            "subs2030":                   subs2030,
+            "subs2070":                   subs2070,
+            "wdr_risk":                   wdr_risk,
+            "rainfall_risk":              rainfall_risk,
+            "wind_speed_risk":            wind_speed_risk,
+            "wildfire_risk":              wildfire_risk,
+        }
+
+        # ── PRELIM OUTPUT — no climate risk ───────────────────────
+        wb_prelim  = load_workbook(EXCEL_FILE)
+        ws4_prelim = wb_prelim["4.0"]
+        write_sheet_4_base(ws4_prelim, wb_data)
+
+        ws7_prelim = wb_prelim["7.0"]
+        write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim)
+
+        write_sheet_10(wb_prelim)
+
+        insert_rooms_with_template(
+            cr_pdf_path     = cr_pdf,
+            workbook        = wb_prelim,
+            sheet_name      = "11.0",
+            insert_at_row   = 5,
+            template_row    = 4,
+            room_col_left   = "A",
+            room_col_right  = "J",
+            tfa             = tfa,
+            highest_bedroom = highest_bedroom
+        )
+
+        prelim_file = os.path.join(OUTPUT_ROOT, f"{prop_name}_Prelim.xlsx")
+        wb_prelim.save(prelim_file)
+        print(f"📄 Prelim saved: {prelim_file}")
+
+        # ── CONSTRUCTION OUTPUT — with climate risk ───────────────
+        wb_construction  = load_workbook(EXCEL_FILE)
+        ws4_construction = wb_construction["4.0"]
+        write_sheet_4_base(ws4_construction, wb_data)
+        write_sheet_4_climate_risk(ws4_construction, wb_data)
+
+        ws7_construction = wb_construction["7.0"]
+        write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction)
+
+        write_sheet_10(wb_construction)
+
+        insert_rooms_with_template(
+            cr_pdf_path     = cr_pdf,
+            workbook        = wb_construction,
+            sheet_name      = "11.0",
+            insert_at_row   = 5,
+            template_row    = 4,
+            room_col_left   = "A",
+            room_col_right  = "J",
+            tfa             = tfa,
+            highest_bedroom = highest_bedroom
+        )
+
+        construction_file = os.path.join(OUTPUT_ROOT, f"{prop_name}_Construction.xlsx")
+        wb_construction.save(construction_file)
+        print(f"🏗️  Construction saved: {construction_file}")
+
+        print(f"✅ Completed {prop_name}\n")
+
+    except Exception as e:
+        import traceback
+        print(f"❌ Skipped {prop_name} due to error: {e}")
+        traceback.print_exc()
+        continue
+
+# ================================================================
+# SUMMARY
+# ================================================================
+elapsed = time.time() - start_time
+print(f"\n⏱️  Total execution time: {elapsed:.2f}s ({elapsed / 60:.2f} min)")
