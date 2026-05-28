@@ -530,6 +530,61 @@ def extract_property_detachment_from_cr(path):
     return ""
 
 # ================================================================
+# EXTRACT PROPERTY TYPE FROM EPR PDF
+# Pulls the "Property Type" value from the EPR dwelling-details
+# block (the line right above "Total Floor Area"),
+# e.g. "End-Terrace House", "Mid-Terrace House", "Detached Bungalow".
+# ================================================================
+def extract_property_type_from_epr(epr_text):
+    if not epr_text:
+        return ""
+
+    # 1) Same-line: "Property Type   End-Terrace House"
+    #    Only accept when the captured value looks like a dwelling type
+    #    (otherwise we may be matching a label-only line in a stacked layout).
+    type_keywords = ("house", "flat", "maisonette", "bungalow", "park home")
+    m = re.search(
+        r"Property\s*Type\s*[:\-]?\s*([A-Za-z][A-Za-z \-/]*?)(?=\s*(?:Total\s+Floor\s+Area|Assessment|Submission|Reference|Dwelling|\r|\n|$))",
+        epr_text, re.IGNORECASE,
+    )
+    if m:
+        cand = re.sub(r"\s{2,}", " ", m.group(1)).strip()
+        if cand and any(t in cand.lower() for t in type_keywords):
+            return cand
+
+    # 2) Stacked layout: label column then value column.
+    #    Find the "Property Type" label line, then take the value that
+    #    sits just before the "Total Floor Area" value.
+    lines = [l.strip() for l in epr_text.splitlines()]
+    for i, line in enumerate(lines):
+        if line.lower().startswith("property type"):
+            tail = re.sub(r"(?i)property\s*type\s*[:\-]?\s*", "", line).strip()
+            if tail:
+                return re.sub(r"\s{2,}", " ", tail).strip()
+            # Stacked: the value lives right above the Total Floor Area value
+            # (which looks like "77 m2"). Walk forward to that area figure
+            # and take the non-numeric line immediately before it.
+            for j in range(i + 1, len(lines)):
+                if re.match(r"^\d+(\.\d+)?\s*m", lines[j], re.IGNORECASE):
+                    for k in range(j - 1, i, -1):
+                        cand = lines[k].strip()
+                        if cand and any(t in cand.lower() for t in type_keywords):
+                            return re.sub(r"\s{2,}", " ", cand).strip()
+                    break
+            # Fallback: first dwelling-type-looking value line after label
+            for nxt in lines[i + 1: i + 12]:
+                if nxt and any(t in nxt.lower() for t in type_keywords):
+                    return re.sub(r"\s{2,}", " ", nxt).strip()
+            break
+
+    # 3) Fallback: first line that looks like a dwelling type
+    for line in lines:
+        if any(k in line.lower() for k in type_keywords) and len(line) < 40:
+            return re.sub(r"\s{2,}", " ", line).strip()
+
+    return ""
+
+# ================================================================
 # SMARTSHEET
 # ================================================================
 def fetch_smartsheet_df(ss_token, sheet_id):
@@ -1186,8 +1241,11 @@ def write_sheet_10(workbook, b3_value, f3_value, log=None):
 
 # ================================================================
 # WRITE SHEET 7.0
+# spec_col is a SINGLE Smartsheet column name. Each output
+# (Prelim / Construction) passes its own column. The spec value
+# for each measure is read from that one column only.
 # ================================================================
-def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_direction, ws4, spec_col_order=None, log=None):
+def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_direction, ws4, spec_col=None, log=None):
     def _log(msg):
         if log: log(msg)
 
@@ -1225,25 +1283,17 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
         _seq += 1
     next_unknown_seq = _seq
 
-    _default_col_order = [
-        "Construction Design Specification Notes",
-        "Client Specification",
-        "Design Specification Notes",
-    ]
-    _col_order = spec_col_order if spec_col_order else _default_col_order
-
     def get_spec(abbr):
+        # Read the spec value from the single chosen column only.
         if df_specs.empty or "Abbreviation" not in df_specs.columns:
+            return ""
+        if not spec_col or spec_col not in df_specs.columns:
             return ""
         spec_row = df_specs[df_specs["Abbreviation"] == abbr]
         if spec_row.empty:
             return ""
-        r = spec_row.iloc[0]
-        for col in _col_order:
-            val = r.get(col, "")
-            if val and str(val).strip():
-                return str(val).strip()
-        return ""
+        val = spec_row.iloc[0].get(spec_col, "")
+        return str(val).strip() if val and str(val).strip() else ""
 
     def find_empty_d_row():
         for r in range(17, 23):
@@ -1347,13 +1397,15 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
 
 # ================================================================
 # CORE PROCESSING FUNCTION
+# prelim_spec_col  -> column used for Prelim output's Sheet 7.0
+# construction_spec_col -> column used for Construction output's Sheet 7.0
 # ================================================================
 def process_property(
     cr_path, sn_path, epr_path,
     template_bytes,
     ss_token, sheet_id, property_master_sheet_id, second_sheet_id,
     sheet10_b3, sheet10_f3,
-    spec_col_order,
+    prelim_spec_col, construction_spec_col,
     log
 ):
     start_time = time.time()
@@ -1512,7 +1564,7 @@ def process_property(
     date_built    = extract_date_built_from_sn(sn_path)
     num_storeys   = extract_num_storeys_from_sn(sn_path)
     wall_type     = safe_search(r"Type\s+[A-Z]+\s+(.*)", sn_text)
-    property_type = extract_property_detachment_from_cr(cr_path)
+    property_type = extract_property_type_from_epr(epr_text)
     exposure_zone = extract_exposure_zone_from_cr(cr_path)
     tfa           = safe_search(r"Total Floor Area\s*([\d\.]+\s*m²?)", epr_text)
     if tfa:        tfa = tfa.replace("m²", "m2")
@@ -1526,6 +1578,13 @@ def process_property(
     # -- Fetch client spec sheet --
     log("🔗 Fetching Smartsheet Client Specification...")
     df_specs = fetch_client_spec_df(ss_token, second_sheet_id)
+
+    # -- Validate spec columns exist (warn only) --
+    if not df_specs.empty:
+        if prelim_spec_col and prelim_spec_col not in df_specs.columns:
+            log(f"⚠️ Prelim spec column '{prelim_spec_col}' not found in Client Spec sheet — Prelim specs will be blank")
+        if construction_spec_col and construction_spec_col not in df_specs.columns:
+            log(f"⚠️ Construction spec column '{construction_spec_col}' not found in Client Spec sheet — Construction specs will be blank")
 
     # -- Bundle all extracted data --
     wb_data = {
@@ -1561,13 +1620,13 @@ def process_property(
         "wildfire_risk":              wildfire_risk,
     }
 
-    # ── PRELIM OUTPUT — no climate risk ──────────────────────────
-    log("📄 Building Prelim output...")
+    # ── PRELIM OUTPUT — no climate risk, uses PRELIM spec column ──
+    log(f"📄 Building Prelim output (spec column: '{prelim_spec_col}')...")
     wb_prelim  = load_workbook(io.BytesIO(template_bytes))
     ws4_prelim = wb_prelim["4.0"]
     write_sheet_4_base(ws4_prelim, wb_data)
     ws7_prelim = wb_prelim["7.0"]
-    write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim, spec_col_order=spec_col_order, log=log)
+    write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim, spec_col=prelim_spec_col, log=log)
     write_sheet_10(wb_prelim, sheet10_b3, sheet10_f3, log=log)
     insert_rooms_with_template(
         cr_pdf_path=cr_path, workbook=wb_prelim, sheet_name="11.0",
@@ -1579,14 +1638,14 @@ def process_property(
     prelim_buffer.seek(0)
     log("✅ Prelim output ready")
 
-    # ── CONSTRUCTION OUTPUT — with climate risk ───────────────────
-    log("🏗️  Building Construction output...")
+    # ── CONSTRUCTION OUTPUT — with climate risk, uses CONSTRUCTION spec column ──
+    log(f"🏗️  Building Construction output (spec column: '{construction_spec_col}')...")
     wb_construction  = load_workbook(io.BytesIO(template_bytes))
     ws4_construction = wb_construction["4.0"]
     write_sheet_4_base(ws4_construction, wb_data)
     write_sheet_4_climate_risk(ws4_construction, wb_data)
     ws7_construction = wb_construction["7.0"]
-    write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction, spec_col_order=spec_col_order, log=log)
+    write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction, spec_col=construction_spec_col, log=log)
     write_sheet_10(wb_construction, sheet10_b3, sheet10_f3, log=log)
     insert_rooms_with_template(
         cr_pdf_path=cr_path, workbook=wb_construction, sheet_name="11.0",
@@ -1635,7 +1694,7 @@ else:
         unsafe_allow_html=True
     )
 
-# ── SIDEBAR — Sheet IDs, Sheet 10 values, Spec priority, Template ──
+# ── SIDEBAR — Sheet IDs, Sheet 10 values, Spec columns, Template ──
 with st.sidebar:
     st.markdown("### Configuration")
     st.markdown("")
@@ -1653,45 +1712,28 @@ with st.sidebar:
 
     st.markdown("**Sheet 10 — Local Authority**")
     sheet10_b3 = st.text_input("Local Authority Name (B3)", placeholder="e.g. Croydon Council", key="b3")
-    sheet10_f3 = st.text_input("Year (F3)", placeholder="e.g. 2026", key="f3")
+    sheet10_f3 = st.text_input("REF (F3)", placeholder="e.g. 1024/CDN", key="f3")
 
     st.markdown("---")
 
-    st.markdown("**Client Spec — Column Priority**")
-    st.caption("Paste the exact column names below. Top column is checked first. First non-empty value wins.")
+    st.markdown("**Client Spec — Columns**")
+    st.caption("Enter the exact Smartsheet column name for each output. The Prelim report pulls specs from the Prelim column; the Construction report from the Construction column.")
 
-    ALL_SPEC_COLS = [
-        "Construction Design Specification Notes",
-        "Client Specification",
-        "Design Specification Notes",
-    ]
-
-    spec_col_text = st.text_area(
-        "Paste column names",
-        value="\n".join(ALL_SPEC_COLS),
-        height=115,
-        key="spec_col_text",
-        label_visibility="collapsed",
-        placeholder="Construction Design Specification Notes\nClient Specification\nDesign Specification Notes",
+    prelim_spec_col = st.text_input(
+        "Prelim column",
+        placeholder="e.g. Client Specification",
+        key="prelim_spec_col",
+        help="Exact Smartsheet column name used for the Prelim report's specifications.",
+    )
+    construction_spec_col = st.text_input(
+        "Construction column",
+        placeholder="e.g. Construction Design Specification Notes",
+        key="construction_spec_col",
+        help="Exact Smartsheet column name used for the Construction report's specifications.",
     )
 
-    spec_col_order = [
-        c.strip().strip(",")
-        for c in re.split(r"[\n,]+", spec_col_text)
-        if c.strip()
-    ]
-
-    if not spec_col_order:
-        st.warning("⚠️ No spec columns pasted — default column priority will be used.")
-        spec_col_order = ALL_SPEC_COLS
-
-    for i, col in enumerate(spec_col_order, 1):
-        short = col.replace(" Specification", " Spec").replace("Construction Design ", "CD ")
-        st.markdown(
-            f'<div style="font-size:0.78rem;color:#4A5A72;padding:3px 0">'
-            f'<span style="color:#1F3A5F;font-weight:600">{i}.</span> {short}</div>',
-            unsafe_allow_html=True
-        )
+    prelim_spec_col = prelim_spec_col.strip()
+    construction_spec_col = construction_spec_col.strip()
 
     st.markdown("---")
 
@@ -1733,6 +1775,8 @@ with col_left:
         "Property Master Sheet ID": bool(property_master_sheet_id),
         "Client Spec Sheet ID":  bool(second_sheet_id),
         "Local Authority":       bool(sheet10_b3),
+        "Prelim column":         bool(prelim_spec_col),
+        "Construction column":   bool(construction_spec_col),
     }
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1816,7 +1860,8 @@ if run_btn:
             second_sheet_id=int(second_sheet_id),
             sheet10_b3=sheet10_b3,
             sheet10_f3=sheet10_f3,
-            spec_col_order=spec_col_order,
+            prelim_spec_col=prelim_spec_col,
+            construction_spec_col=construction_spec_col,
             log=log,
         )
 
