@@ -39,6 +39,17 @@ RAINFALL_RISK_COL     = "Rainfall Risk"
 WIND_SPEED_RISK_COL   = "Wind speed Risk"
 WILDFIRE_RISK_COL     = "Wildfire Risk"
 
+# ── Client Spec sheet column names — one per output ─────────────
+# Prelim report reads its specs ONLY from PRELIM_SPEC_COL.
+# Construction report reads its specs ONLY from CONSTRUCTION_SPEC_COL.
+# Set these to the EXACT Smartsheet column names you want.
+PRELIM_SPEC_COL       = "Client Specification"
+CONSTRUCTION_SPEC_COL = "Construction Design Specification Notes"
+
+# ── Sheet 10 values ─────────────────────────────────────────────
+# SHEET10_F3_VALUE is the REF value (e.g. "1024/CDN")
+# SHEET10_F3_VALUE = "1024/CDN"
+
 SM_URL     = f"https://api.smartsheet.eu/2.0/sheets/{SHEET_ID}"
 SM_HEADERS = {"Authorization": f"Bearer {SS_TOKEN}"}
 # Add your Property Master Smartsheet ID in your config before running.
@@ -246,6 +257,55 @@ def extract_property_detachment_from_cr(path: str) -> str:
             value = re.sub(r"(?i)property\s+detachment\s*", "", stripped).strip()
             if value:
                 return value
+    return ""
+
+
+# ================================================================
+# EXTRACT PROPERTY TYPE FROM EPR PDF
+# Pulls the "Property Type" value from the EPR dwelling-details
+# block (the line right above "Total Floor Area"),
+# e.g. "End-Terrace House", "Mid-Terrace House", "Detached Bungalow".
+# ================================================================
+def extract_property_type_from_epr(epr_text: str) -> str:
+    if not epr_text:
+        return ""
+
+    # 1) Same-line: "Property Type   End-Terrace House"
+    type_keywords = ("house", "flat", "maisonette", "bungalow", "park home")
+    m = re.search(
+        r"Property\s*Type\s*[:\-]?\s*([A-Za-z][A-Za-z \-/]*?)(?=\s*(?:Total\s+Floor\s+Area|Assessment|Submission|Reference|Dwelling|\r|\n|$))",
+        epr_text, re.IGNORECASE,
+    )
+    if m:
+        cand = re.sub(r"\s{2,}", " ", m.group(1)).strip()
+        if cand and any(t in cand.lower() for t in type_keywords):
+            return cand
+
+    # 2) Stacked layout: label column then value column.
+    lines = [l.strip() for l in epr_text.splitlines()]
+    for i, line in enumerate(lines):
+        if line.lower().startswith("property type"):
+            tail = re.sub(r"(?i)property\s*type\s*[:\-]?\s*", "", line).strip()
+            if tail:
+                return re.sub(r"\s{2,}", " ", tail).strip()
+            # Stacked: value lives right above the Total Floor Area figure
+            for j in range(i + 1, len(lines)):
+                if re.match(r"^\d+(\.\d+)?\s*m", lines[j], re.IGNORECASE):
+                    for k in range(j - 1, i, -1):
+                        cand = lines[k].strip()
+                        if cand and any(t in cand.lower() for t in type_keywords):
+                            return re.sub(r"\s{2,}", " ", cand).strip()
+                    break
+            for nxt in lines[i + 1: i + 12]:
+                if nxt and any(t in nxt.lower() for t in type_keywords):
+                    return re.sub(r"\s{2,}", " ", nxt).strip()
+            break
+
+    # 3) Fallback: first line that looks like a dwelling type
+    for line in lines:
+        if any(k in line.lower() for k in type_keywords) and len(line) < 40:
+            return re.sub(r"\s{2,}", " ", line).strip()
+
     return ""
 
 
@@ -555,28 +615,19 @@ def extract_rooms_from_contents(cr_pdf_path: str) -> list:
         return []
 
     # ── Step 2: pair item names with their page numbers ──────────────────
-    # Elmhurst PDFs typically emit: "Room Name\n22\n" or interleaved.
-    # We walk the list; when we see a digit-only token after a text token
-    # we treat (text_token, digit_token) as a (name, page_no) pair.
     pairs = []   # list of (name_str, page_no_int)
     i = 0
     while i < len(cleaned):
         token = cleaned[i]
         if token.isdigit():
-            # Orphan page number — try to attach to the previous pair's name
-            # (happens when name and number are on the same visual line but
-            #  the PDF emits them as two tokens)
             if pairs:
-                # already have a pair; this is just noise — skip
                 pass
             i += 1
             continue
-        # Look ahead for a page number
         if i + 1 < len(cleaned) and cleaned[i + 1].isdigit():
             pairs.append((token, int(cleaned[i + 1])))
             i += 2
         else:
-            # No page number immediately follows; record with page_no=-1
             pairs.append((token, -1))
             i += 1
 
@@ -584,8 +635,6 @@ def extract_rooms_from_contents(cr_pdf_path: str) -> list:
         return []
 
     # ── Step 3: find the slice of pairs that represent actual rooms ───────
-    # We look for the first pair whose name looks like a room, then collect
-    # until we hit an end-section keyword.
     start_idx = None
     for idx, (name, _) in enumerate(pairs):
         if _is_end_section(name):
@@ -595,9 +644,6 @@ def extract_rooms_from_contents(cr_pdf_path: str) -> list:
             break
 
     if start_idx is None:
-        # Fallback: take everything that is not a known non-room and not an
-        # end-section marker, skipping the first two entries (usually
-        # "Property Details" and "Property Summary").
         print("  ⚠️  No recognised room keyword found; using fallback extraction.")
         rooms = [
             name for name, _ in pairs[2:]
@@ -887,7 +933,6 @@ def write_room_row(ws, row, d, room):
 
 # ================================================================
 # MAIN ROOM INSERTION (Sheet 11.0)
-# — Uses the new robust extract_rooms_from_contents()
 # ================================================================
 def insert_rooms_with_template(
     cr_pdf_path,
@@ -1072,6 +1117,7 @@ def write_sheet_4_climate_risk(ws, wb_data: dict):
 
 # ================================================================
 # WRITE SHEET 10.0
+# F3 holds the REF value (SHEET10_F3_VALUE, e.g. "1024/CDN")
 # ================================================================
 def write_sheet_10(workbook):
     if "10.0" not in workbook.sheetnames:
@@ -1079,14 +1125,17 @@ def write_sheet_10(workbook):
         return
     ws = workbook["10.0"]
     ws[get_master_cell(ws, "B3")] = SHEET10_B3_VALUE
-    ws[get_master_cell(ws, "F3")] = SHEET10_F3_VALUE
-    print(f"  ✓ Sheet 10.0: B3='{SHEET10_B3_VALUE}', F3='{SHEET10_F3_VALUE}'")
+    ws[get_master_cell(ws, "F3")] = SHEET10_F3_VALUE   # REF, e.g. "1024/CDN"
+    print(f"  ✓ Sheet 10.0: B3='{SHEET10_B3_VALUE}', F3 (REF)='{SHEET10_F3_VALUE}'")
 
 
 # ================================================================
 # WRITE SHEET 7.0
+# spec_col is a SINGLE Smartsheet column name. Each output
+# (Prelim / Construction) passes its own column. The spec value
+# for each measure is read from that one column only.
 # ================================================================
-def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_direction, ws4):
+def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_direction, ws4, spec_col=None):
 
     measure_to_cell = {
         "Trickle Vents":       "A2",
@@ -1164,18 +1213,16 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
     next_unknown_seq = _seq
 
     def get_spec(abbr: str) -> str:
+        # Read the spec value from the single chosen column only.
         if df_specs.empty or "Abbreviation" not in df_specs.columns:
+            return ""
+        if not spec_col or spec_col not in df_specs.columns:
             return ""
         spec_row = df_specs[df_specs["Abbreviation"] == abbr]
         if spec_row.empty:
             return ""
-        r = spec_row.iloc[0]
-        return (
-            r.get("Construction Design Specification Notes")
-            or r.get("Client Specification")
-            or r.get("Design Specification Notes", "")
-            or ""
-        )
+        val = spec_row.iloc[0].get(spec_col, "")
+        return str(val).strip() if val and str(val).strip() else ""
 
     def find_empty_d_row():
         for r in range(17, 23):
@@ -1449,7 +1496,7 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         date_built    = extract_date_built_from_sn(sn_pdf)
         num_storeys   = extract_num_storeys_from_sn(sn_pdf)
         wall_type     = safe_search(r"Type\s+[A-Z]+\s+(.*)", sn_text)
-        property_type = extract_property_detachment_from_cr(cr_pdf)
+        property_type = extract_property_type_from_epr(epr_text)
         hab_rooms     = safe_search(r"Habitable Rooms:\s*(\d+)", sn_text)
         exposure_zone = extract_exposure_zone_from_cr(cr_pdf)
 
@@ -1473,6 +1520,13 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         for r2 in sheet2["rows"]:
             rows2.append({col_map2.get(c["columnId"], ""): c.get("displayValue", c.get("value", "")) for c in r2["cells"]})
         df_specs = pd.DataFrame(rows2)
+
+        # ── Validate spec columns exist (warn only) ───────────────
+        if not df_specs.empty:
+            if PRELIM_SPEC_COL and PRELIM_SPEC_COL not in df_specs.columns:
+                print(f"⚠️  {prop_name} – Prelim spec column '{PRELIM_SPEC_COL}' not in Client Spec sheet — Prelim specs will be blank")
+            if CONSTRUCTION_SPEC_COL and CONSTRUCTION_SPEC_COL not in df_specs.columns:
+                print(f"⚠️  {prop_name} – Construction spec column '{CONSTRUCTION_SPEC_COL}' not in Client Spec sheet — Construction specs will be blank")
 
         # ── Bundle all extracted data ─────────────────────────────
         wb_data = {
@@ -1508,13 +1562,13 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
             "wildfire_risk":              wildfire_risk,
         }
 
-        # ── PRELIM OUTPUT — no climate risk ───────────────────────
+        # ── PRELIM OUTPUT — no climate risk, uses PRELIM_SPEC_COL ──
         wb_prelim  = load_workbook(EXCEL_FILE)
         ws4_prelim = wb_prelim["4.0"]
         write_sheet_4_base(ws4_prelim, wb_data)
 
         ws7_prelim = wb_prelim["7.0"]
-        write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim)
+        write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim, spec_col=PRELIM_SPEC_COL)
 
         write_sheet_10(wb_prelim)
 
@@ -1534,14 +1588,14 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         wb_prelim.save(prelim_file)
         print(f"📄 Prelim saved: {prelim_file}")
 
-        # ── CONSTRUCTION OUTPUT — with climate risk ───────────────
+        # ── CONSTRUCTION OUTPUT — with climate risk, uses CONSTRUCTION_SPEC_COL ──
         wb_construction  = load_workbook(EXCEL_FILE)
         ws4_construction = wb_construction["4.0"]
         write_sheet_4_base(ws4_construction, wb_data)
         write_sheet_4_climate_risk(ws4_construction, wb_data)
 
         ws7_construction = wb_construction["7.0"]
-        write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction)
+        write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction, spec_col=CONSTRUCTION_SPEC_COL)
 
         write_sheet_10(wb_construction)
 
