@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 from openpyxl import load_workbook
 from copy import copy
-from openpyxl.utils import range_boundaries
+from openpyxl.utils import range_boundaries, column_index_from_string
 import time
 import tempfile
 import io
@@ -45,6 +45,36 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+# ================================================================
+# LOGIN CREDENTIALS  —  EDIT HERE IN THE FUTURE
+# ================================================================
+# Emails and passwords are kept SEPARATE so you can change either
+# one without touching the other.
+#
+#  • To rotate EVERYONE's password at once: change DEFAULT_PASSWORD.
+#  • To give ONE user a different password:  put it as that user's
+#    value in USERS (instead of None).
+#  • To add / remove a user:                 add / remove a line in USERS.
+#
+# Emails are matched case-insensitively. Passwords are matched exactly.
+# ----------------------------------------------------------------
+
+DEFAULT_PASSWORD = "DSL@2026"
+
+USERS = {
+    # email (lower-case)                          : password (None = use DEFAULT_PASSWORD)
+    "pavan.banavasi@designspecifics.co.uk":      None,
+    "prasanth.tathireddy@designspecifics.co.uk": None,
+    "gopi@compliancespecifics.co.uk":            None,
+    "sudheer.sivarathri@designspecifics.co.uk":  None,
+    "srinu.dantala@designspecifics.co.uk":       None,
+}
+
+
+def get_password_for(email):
+    """Return the effective password for an email (per-user override or default)."""
+    pw = USERS.get(email)
+    return pw if pw else DEFAULT_PASSWORD
 
 # ================================================================
 # LOAD LOGO
@@ -412,8 +442,92 @@ hr {
     color: var(--muted);
     margin-top: 0.25rem;
 }
+
+/* Login */
+.login-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 2rem 2.2rem;
+    margin-top: 1rem;
+    box-shadow: 0 4px 18px rgba(31, 58, 95, 0.06);
+}
+.login-title {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--brand-navy);
+    margin-bottom: 0.3rem;
+}
+.login-sub {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-bottom: 1.2rem;
+}
 </style>
 """, unsafe_allow_html=True)
+
+# ================================================================
+# LOGIN GATE
+# Renders a styled sign-in form. Until the user signs in, the rest
+# of the app does not run (st.stop()). Each browser session is
+# independent, so one person logging in / uploading never affects
+# another person's session.
+# ================================================================
+def render_login():
+    if LOGO_B64:
+        st.markdown(
+            f'''
+            <div class="logo-wrap">
+                <img src="data:image/png;base64,{LOGO_B64}" alt="Design Specifics" />
+                <div class="logo-divider"></div>
+                <div>
+                    <div class="logo-title">Power Asset · Retrofit Design Exporter</div>
+                    <div class="logo-subtitle">Please sign in to continue</div>
+                </div>
+            </div>
+            ''',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '''
+            <div class="logo-wrap">
+                <div>
+                    <div class="logo-title">Power Asset · Retrofit Design Exporter</div>
+                    <div class="logo-subtitle">Please sign in to continue</div>
+                </div>
+            </div>
+            ''',
+            unsafe_allow_html=True,
+        )
+
+    _l, mid, _r = st.columns([1, 1.3, 1])
+    with mid:
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+        st.markdown('<div class="login-title">Sign in</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-sub">Use your Design Specifics account.</div>', unsafe_allow_html=True)
+
+        with st.form("login_form", clear_on_submit=False):
+            email_in = st.text_input("Email", placeholder="name@designspecifics.co.uk")
+            pass_in  = st.text_input("Password", type="password", placeholder="••••••••")
+            submitted = st.form_submit_button("Sign in")
+
+        if submitted:
+            email_norm = (email_in or "").strip().lower()
+            if email_norm in USERS and (pass_in or "") == get_password_for(email_norm):
+                st.session_state["authenticated"] = True
+                st.session_state["user_email"] = email_norm
+                st.rerun()
+            else:
+                st.error("Invalid email or password.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+if not st.session_state.get("authenticated"):
+    render_login()
+    st.stop()
+
 
 # ================================================================
 # CUSTOM ROUND
@@ -439,6 +553,10 @@ def is_wet_room(room_name): return any(kw in room_name.lower() for kw in WET_ROO
 
 def is_wc_or_utility(room_name):
     return any(kw in room_name.lower().strip() for kw in ["wc", "w/c", "toilet", "utility"])
+
+def is_bathroom_or_kitchen(room_name):
+    name = room_name.lower()
+    return "kitchen" in name or "bathroom" in name
 
 def wet_room_sort_key(room_name):
     name = room_name.lower()
@@ -1025,6 +1143,15 @@ def remerge(ws, ranges):
 
 # ================================================================
 # WRITE ROOM ROW
+#
+# Changes from previous version:
+#   • Point 3 — WC / W/C / Utility:  B = CR (condensation) value,
+#       D = "No minimum".
+#   • Point 2 — Bathroom & Kitchen ONLY:  column M (Proposed) is driven
+#       by the Background Ventilation Area (D). Value present -> "Sealed";
+#       "No"/"No minimum"/blank -> "No Works". (Other wet rooms keep the
+#       fans-based logic.)
+#   • Point 4 — Hallway:  column N is always "No Works".
 # ================================================================
 def write_room_row(ws, row, d, room):
     def v(x): return x if x is not None else "Not Extracted"
@@ -1032,13 +1159,15 @@ def write_room_row(ws, row, d, room):
     bg_value   = d["background"]
     fans_value = v(d["fans"])
     wet_room_keys = ["kitchen", "bathroom", "wetroom", "wet room", "wc", "w/c", "toilet", "utility"]
-    is_wet = any(w in room_lower for w in wet_room_keys)
+    is_wet  = any(w in room_lower for w in wet_room_keys)
+    is_wcu  = is_wc_or_utility(room)
+    is_bk   = is_bathroom_or_kitchen(room)
+    is_hall = "hall" in room_lower
 
-    if is_wc_or_utility(room):
-        ws[f"B{row}"].value = "No minimum"
-    else:
-        ws[f"B{row}"].value = v(d["condensation"])
+    # --- Column B: always the CR (condensation) value, incl. WC/W-C/Utility ---
+    ws[f"B{row}"].value = v(d["condensation"])
 
+    # --- Column C: background ventilation requirement ---
     if bg_value is None:
         ws[f"C{row}"].value = "No"
     elif "bathroom" in room_lower or "wetroom" in room_lower:
@@ -1046,7 +1175,12 @@ def write_room_row(ws, row, d, room):
     else:
         ws[f"C{row}"].value = "8000mm2"
 
-    ws[f"D{row}"].value = "No" if bg_value is None else f"{bg_value}mm2"
+    # --- Column D: "No minimum" for WC/W-C/Utility, else the background area ---
+    if is_wcu:
+        ws[f"D{row}"].value = "No minimum"
+    else:
+        ws[f"D{row}"].value = "No" if bg_value is None else f"{bg_value}mm2"
+
     ws[f"E{row}"].value = v(d["undercuts"])
     ws[f"F{row}"].value = v(d["windows"])
 
@@ -1067,16 +1201,27 @@ def write_room_row(ws, row, d, room):
 
     col_c_val     = ws[f"C{row}"].value
     undercuts_val = ws[f"E{row}"].value
-    if is_wet:
+
+    # --- Column M (Proposed) ---
+    if is_bk:
+        # Bathroom & Kitchen: driven by Background Ventilation Area (D).
+        # Value present -> Sealed ; "No"/"No minimum"/blank -> No Works.
+        ws[f"M{row}"].value = "Sealed" if bg_value is not None else "No Works"
+    elif is_wet:
         ws[f"M{row}"].value = "Sealed" if fans_value == "Yes" else "No Works"
     else:
         ws[f"M{row}"].value = "Required" if col_c_val == "No" and undercuts_val == "Yes" else "No Works"
 
-    ws[f"N{row}"].value = (
-        "Required" if d["undercuts"] == "No" else
-        "No Works" if d["undercuts"] == "Yes" else
-        "Not Extracted"
-    )
+    # --- Column N: Hallway is always "No Works" ---
+    if is_hall:
+        ws[f"N{row}"].value = "No Works"
+    else:
+        ws[f"N{row}"].value = (
+            "Required" if d["undercuts"] == "No" else
+            "No Works" if d["undercuts"] == "Yes" else
+            "Not Extracted"
+        )
+
     ws[f"O{row}"].value = (
         "Required" if d["windows"] == "No" else
         "No Works" if d["windows"] == "Yes" else
@@ -1187,7 +1332,7 @@ def write_sheet_4_base(ws, wb_data):
     d = wb_data
     ws[get_master_cell(ws, "B3")]  = d["dwelling_address"]
     ws[get_master_cell(ws, "B4")]  = d["property_id_value"]
-    ws[get_master_cell(ws, "B5")]  = d["local_authority_name"]
+    ws[get_master_cell(ws, "B5")]  = d["local_authority_name"]   # Local Authority -> 4.0 B5 (only)
     ws[get_master_cell(ws, "B6")]  = d["sap_current"]
     ws[get_master_cell(ws, "E3")]  = d["sap_current"]
     ws[get_master_cell(ws, "E9")]  = d["sap_potential"]
@@ -1229,59 +1374,119 @@ def write_sheet_4_climate_risk(ws, wb_data):
 
 # ================================================================
 # WRITE SHEET 10.0
+#
+# Change: Local Authority no longer goes here. Instead:
+#   • B3 <- Project Name (new input)
+#   • F3 <- REF
+#   • B3 is explicitly cleared (left empty).
 # ================================================================
-def write_sheet_10(workbook, b3_value, f3_value, log=None):
+def write_sheet_10(workbook, project_name, f3_value, log=None):
     if "10.0" not in workbook.sheetnames:
         if log: log("⚠️  Sheet '10.0' not found — skipping.")
         return
     ws = workbook["10.0"]
-    ws[get_master_cell(ws, "B3")] = b3_value
-    ws[get_master_cell(ws, "F3")] = f3_value
-    if log: log(f"  ✓ Sheet 10.0: B3='{b3_value}', F3='{f3_value}'")
+    ws[get_master_cell(ws, "B3")] = None          # was Local Authority — now empty
+    ws[get_master_cell(ws, "B3")] = project_name  # Project Name
+    ws[get_master_cell(ws, "F3")] = f3_value      # REF
+    if log: log(f"  ✓ Sheet 10.0: B5(Project)='{project_name}', F3(REF)='{f3_value}', B3=cleared")
 
 # ================================================================
-# WRITE SHEET 7.0
+# WRITE SHEET 7.0  -- REWRITTEN
+#
 # spec_col is a SINGLE Smartsheet column name. Each output
-# (Prelim / Construction) passes its own column. The spec value
-# for each measure is read from that one column only.
+# (Prelim / Construction) passes its own column.
+#
+# Routing rules:
+#   • Standard measures      -> their fixed template rows.
+#   • EXTRA measures (anything not in the standard list):
+#       - heating / renewable  -> next EMPTY renewable row (17-21) NOT used
+#                                 by a selected standard measure.
+#       - fabric / ventilation -> the "Other please specify" row (row 14).
+#   • An extra measure NEVER overwrites a selected standard measure's row.
+#   • Every extra measure is ALWAYS Category = "Minor" (column H).
+#   • Sequence (col G): standard measures get 1..N install order; extras
+#     continue N+1, N+2… (renewable extras first, then fabric extras).
+#   • Communal PV is handled specially (fills SPV row, relabels C22).
 # ================================================================
-def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_direction, ws4, spec_col=None, log=None):
+def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_direction,
+                  ws4, spec_col=None, log=None):
     def _log(msg):
         if log: log(msg)
 
     measure_to_cell = {
-        "Trickle Vents": "A2", "Door undercuts": "A4", "dMEV": "A3",
-        "LI (B9)": "A5", "CWI": "A6", "EWI": "A7", "IWI": "A8",
-        "UFI": "A9", "FRI": "A10", "RiR and/or Skeiling": "A11",
-        "Windows": "A12", "Doors": "A13", "Boiler/FTCH": "A17",
-        "ESH": "A18", "ASHP": "A19", "GSHP": "A20",
-        "Solar Thermal": "A21", "SPV": "A22",
+        "Trickle Vents":       "A2",
+        "dMEV":                "A3",
+        "Door undercuts":      "A4",
+        "LI (B9)":             "A5",
+        "CWI":                 "A6",
+        "EWI":                 "A7",
+        "IWI":                 "A8",
+        "UFI":                 "A9",
+        "FRI":                 "A10",
+        "RiR and/or Skeiling": "A11",
+        "Windows":             "A12",
+        "Doors":               "A13",
+        # row 14 = "Other please specify" (reserved for extra fabric measures)
+        "Boiler/FTCH":         "A17",
+        "ESH":                 "A18",
+        "ASHP":                "A19",
+        "GSHP":                "A20",
+        "Solar Thermal":       "A21",
+        "SPV":                 "A22",
     }
+
     abbrev_map = {
-        "Trickle Vents": "TV", "dMEV": "dMEV", "Door undercuts": "DRU",
-        "LI (B9)": "LI", "CWI": "CWI", "EWI": "EWI", "IWI": "IWI",
-        "UFI": "UFI", "FRI": "FRI", "RiR and/or Skeiling": "RiR/SKI",
-        "Windows": "Windows", "Doors": "Doors", "Boiler/FTCH": "BLR",
-        "ESH": "ESH", "ASHP": "ASHP", "GSHP": "GSHP",
-        "Solar Thermal": "ST", "SPV": "SPV", "LEL": "LEL", "HWC": "HWC",
-        "Draught-Proofing": "DPRF",
-        "Upgrade boiler, same fuel": "UBLR",
-        "Heat Recovery System for Mixer Showers": "HRSMS",
-        "Communal PV": "SPV",
+        "Trickle Vents":       "TV",
+        "dMEV":                "dMEV",
+        "Door undercuts":      "DRU",
+        "LI (B9)":             "LI",
+        "CWI":                 "CWI",
+        "EWI":                 "EWI",
+        "IWI":                 "IWI",
+        "UFI":                 "UFI",
+        "FRI":                 "FRI",
+        "RiR and/or Skeiling": "RiR/SKI",
+        "Windows":             "Windows",
+        "Doors":               "Doors",
+        "Boiler/FTCH":         "BLR",
+        "ESH":                 "ESH",
+        "ASHP":                "ASHP",
+        "GSHP":                "GSHP",
+        "Solar Thermal":       "ST",
+        "SPV":                 "SPV",
+        # ---- extra measures (drawing keys for column C) ----
+        "Sub Floor Ventilation":  "AirEx Floorvent",
+        "Sub-Floor Ventilation":  "AirEx Floorvent",
+        "AirEx Floorvent":        "AirEx Floorvent",
+        "AirEx":                  "AirEx Floorvent",
+        "Air Brick":              "AirEx Floorvent",
+        "Electric Meter Dual":    "EM-D",
+        "Solar Diverter":         "SD",
+        "Solar iBoost":           "SD",
+        "LEL":                    "LEL",
+        "HWC":                    "HWC",
+        "Draught-Proofing":       "DPRF",
+        "Upgrade boiler, same fuel":                "UBLR",
+        "Heat Recovery System for Mixer Showers":   "HRSMS",
+        "Communal PV":            "SPV",
     }
+
     SEQUENCE_ORDER = [
         ["dMEV"], ["CWI"], ["EWI"], ["IWI"], ["LI (B9)"], ["FRI"],
         ["RiR and/or Skeiling"], ["Windows", "Doors"], ["Boiler/FTCH"],
         ["ESH"], ["ASHP"], ["GSHP"], ["Solar Thermal"], ["HWC"], ["LEL"], ["SPV"],
     ]
 
-    measure_seq_lookup = {}
-    _seq = 1
-    for group in SEQUENCE_ORDER:
-        for name in group:
-            measure_seq_lookup[name] = _seq
-        _seq += 1
-    next_unknown_seq = _seq
+    HEATING_RENEWABLE_KEYWORDS = [
+        "boiler", "ftch", "esh", "storage heater", "ashp", "gshp",
+        "heat pump", "solar", "pv", "photovolta", "thermal", "diverter",
+        "immersion", "battery", "meter", "hwc", "cylinder", "iboost",
+        "renewable", "lel",
+    ]
+
+    def is_heating_renewable(name):
+        n = name.lower()
+        return any(k in n for k in HEATING_RENEWABLE_KEYWORDS)
 
     def get_spec(abbr):
         # Read the spec value from the single chosen column only.
@@ -1295,34 +1500,113 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
         val = spec_row.iloc[0].get(spec_col, "")
         return str(val).strip() if val and str(val).strip() else ""
 
-    def find_empty_d_row():
-        for r in range(17, 23):
-            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
-                return r
-        for r in range(2, 15):
-            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
-                return r
+    # Candidate names for the "Description" column on the Client Spec sheet.
+    DESC_COL_CANDIDATES = ["Description", "Measure Description", "Measure",
+                           "Full Description", "Measure Name"]
+
+    def _spec_desc_col():
+        for c in DESC_COL_CANDIDATES:
+            if c in df_specs.columns:
+                return c
         return None
 
-    measures_list = [m.strip() for m in selected_measures.split(",") if m.strip()]
-    spv_included = False
+    def lookup_extra_from_spec(token):
+        """Match an EXTRA measure (IOE token) against the Client Spec sheet by
+        Abbreviation OR Description, allowing PARTIAL / half-word matches
+        (e.g. IOE 'AirEx' matches Abbreviation 'AirEx Floorvent').
+
+        Returns (description_for_B, abbreviation_for_C, spec_for_D), or
+        None if no match is found — in which case the caller IGNORES the
+        measure entirely (writes nothing)."""
+        token = str(token).strip()
+        if not token or df_specs.empty:
+            return None
+
+        norm = lambda x: re.sub(r"\s+", " ", str(x).strip().lower())
+        nt = norm(token)
+        if not nt:
+            return None
+
+        desc_col = _spec_desc_col()
+        has_abbr = "Abbreviation" in df_specs.columns
+
+        # Rank candidates (lower = better):
+        #   0 exact Abbreviation       1 exact Description
+        #   2 token inside Abbreviation 3 Abbreviation inside token
+        #   4 token inside Description  5 Description inside token
+        # Substring (ranks 2-5) only when the token is >= 3 chars to avoid
+        # tiny accidental matches.
+        best, best_rank = None, 99
+        allow_sub = len(nt) >= 3
+        for _, r in df_specs.iterrows():
+            na = norm(r.get("Abbreviation", "")) if has_abbr else ""
+            nd = norm(r.get(desc_col, "")) if desc_col else ""
+            rank = None
+            if has_abbr and na and na == nt:
+                rank = 0
+            elif desc_col and nd and nd == nt:
+                rank = 1
+            elif allow_sub and has_abbr and na and len(na) >= 3 and nt in na:
+                rank = 2
+            elif allow_sub and has_abbr and na and len(na) >= 3 and na in nt:
+                rank = 3
+            elif allow_sub and desc_col and nd and len(nd) >= 3 and nt in nd:
+                rank = 4
+            elif allow_sub and desc_col and nd and len(nd) >= 3 and nd in nt:
+                rank = 5
+            if rank is not None and rank < best_rank:
+                best, best_rank = r, rank
+                if rank == 0:
+                    break
+
+        if best is None:
+            return None  # not in Client Spec → ignore the measure
+
+        abbr = str(best.get("Abbreviation", "")).strip() if has_abbr else ""
+        desc = str(best.get(desc_col, "")).strip() if desc_col else ""
+        spec = ""
+        if spec_col and spec_col in df_specs.columns:
+            v = best.get(spec_col, "")
+            spec = str(v).strip() if v and str(v).strip() else ""
+        return (desc or abbr or token), (abbr or desc or token), spec
+
+    def set_cell_unmerged(cell_ref, value):
+        col_letter = "".join(ch for ch in cell_ref if ch.isalpha())
+        row_num    = int("".join(ch for ch in cell_ref if ch.isdigit()))
+        col_idx    = column_index_from_string(col_letter)
+        for merged in list(ws.merged_cells.ranges):
+            c1, r1, c2, r2 = range_boundaries(str(merged))
+            if r1 <= row_num <= r2 and c1 <= col_idx <= c2:
+                ws.unmerge_cells(str(merged))
+                break
+        ws[get_master_cell(ws, cell_ref)] = value
+
+    def find_other_specify_row():
+        for r in range(2, 16):
+            b = ws[get_master_cell(ws, f"B{r}")].value
+            if isinstance(b, str) and "other" in b.lower() and "specify" in b.lower():
+                return r
+        return 14  # fallback to known template position
+
+    # ===========================================================
+    # 1) Place STANDARD measures + handle Communal PV specially
+    # ===========================================================
+    measures_list  = [m.strip() for m in str(selected_measures).split(",") if m.strip()]
+    known_selected = set()
+    used_rows      = set()
+    extra_measures = []
+    spv_included   = False
 
     for measure in measures_list:
-        is_communal_pv = "communal pv" in measure.lower()
-        if is_communal_pv:
+        # --- Communal PV: fills the SPV row but relabels C22 ---
+        if "communal pv" in measure.lower():
             spv_included = True
-            row_num = int(measure_to_cell["SPV"][1:])
+            row_num = int(measure_to_cell["SPV"][1:])     # 22
             ws[get_master_cell(ws, f"D{row_num}")] = get_spec("SPV")
-            c22_master = get_master_cell(ws, "C22")
-            for merged in list(ws.merged_cells.ranges):
-                c1, r1, c2, r2 = range_boundaries(str(merged))
-                if r1 <= 22 <= r2 and c1 <= 3 <= c2:
-                    ws.unmerge_cells(str(merged))
-                    break
-            ws[c22_master] = "Communal PV"
-            seq = measure_seq_lookup.get("SPV", next_unknown_seq)
-            ws[get_master_cell(ws, f"G{row_num}")] = seq
-            _log(f"  ✓ Communal PV → row {row_num} (SPV spec), C22='Communal PV', seq {seq}")
+            set_cell_unmerged("C22", "Communal PV")
+            known_selected.add("SPV")
+            used_rows.add(row_num)
+            _log(f"  ✓ Communal PV → row {row_num} (SPV spec), C22='Communal PV'")
             continue
 
         matched_key = None
@@ -1331,42 +1615,75 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
                 matched_key = key
                 break
 
-        if matched_key == "SPV":
-            spv_included = True
-
         if matched_key is not None:
+            if matched_key == "SPV":
+                spv_included = True
             row_num = int(measure_to_cell[matched_key][1:])
-            abbr    = abbrev_map.get(matched_key, "")
-            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
-            seq = measure_seq_lookup.get(matched_key, next_unknown_seq)
-            ws[get_master_cell(ws, f"G{row_num}")] = seq
-            _log(f"  ✓ Known measure '{matched_key}' → row {row_num}, seq {seq}")
+            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbrev_map.get(matched_key, ""))
+            known_selected.add(matched_key)
+            used_rows.add(row_num)
+            _log(f"  ✓ Standard measure '{matched_key}' → row {row_num}")
         else:
-            row_num = find_empty_d_row()
-            if row_num is None:
-                _log(f"  ⚠️  No empty row found for '{measure}' — skipped")
-                continue
-            b_master = get_master_cell(ws, f"B{row_num}")
-            for merged in list(ws.merged_cells.ranges):
-                c1, r1, c2, r2 = range_boundaries(str(merged))
-                if r1 <= row_num <= r2 and c1 <= 2 <= c2:
-                    ws.unmerge_cells(str(merged))
-                    break
-            ws[b_master] = measure
-            abbr     = abbrev_map.get(measure, measure[:4].upper())
-            c_master = get_master_cell(ws, f"C{row_num}")
-            for merged in list(ws.merged_cells.ranges):
-                c1, r1, c2, r2 = range_boundaries(str(merged))
-                if r1 <= row_num <= r2 and c1 <= 3 <= c2:
-                    ws.unmerge_cells(str(merged))
-                    break
-            ws[c_master] = abbr
-            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
-            ws[get_master_cell(ws, f"G{row_num}")] = next_unknown_seq
-            ws[get_master_cell(ws, f"H{row_num}")] = "Minor"
-            _log(f"  ℹ️  Unknown measure '{measure}' → row {row_num}, seq {next_unknown_seq}")
-            next_unknown_seq += 1
+            extra_measures.append(measure)
 
+    # ===========================================================
+    # 2) Place EXTRA measures
+    # ===========================================================
+    renewable_slots      = list(range(17, 22))   # 17-21 reusable; 22-23 = SPV
+    renewable_extra_rows = []
+    fabric_extra_rows    = []
+
+    def next_empty_renewable_row():
+        for r in renewable_slots:
+            if r in used_rows:
+                continue
+            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
+                return r
+        return None
+
+    other_row  = find_other_specify_row()
+    other_used = False
+
+    for measure in extra_measures:
+        # Pull from the Client Spec Smartsheet (NOT from IOE / Property Master):
+        #   B <- Description, C <- Abbreviation, D <- spec column.
+        # If the measure is not found in the Client Spec sheet → IGNORE it.
+        found = lookup_extra_from_spec(measure)
+        if found is None:
+            _log(f"  ⛔ Extra '{measure}' not found in Client Spec "
+                 f"(no Abbreviation/Description match) — ignored")
+            continue
+        desc, abbr, spec = found
+        classify_text = f"{measure} {desc} {abbr}"
+
+        if is_heating_renewable(classify_text):
+            target = next_empty_renewable_row()
+            if target is None:
+                _log(f"  ⚠️  No empty renewable slot for extra '{measure}' — skipped")
+                continue
+            renewable_extra_rows.append(target)
+            zone = "renewable table"
+        else:
+            if other_used:
+                _log(f"  ⚠️  Extra fabric measure '{measure}' skipped — "
+                     f"'Other please specify' row already used")
+                continue
+            target = other_row
+            other_used = True
+            fabric_extra_rows.append(target)
+            zone = "Other please specify"
+
+        set_cell_unmerged(f"B{target}", desc)               # Description (Client Spec sheet)
+        set_cell_unmerged(f"C{target}", abbr)               # Abbreviation (Client Spec sheet)
+        ws[get_master_cell(ws, f"D{target}")] = spec        # Specification (Client Spec sheet)
+        ws[get_master_cell(ws, f"H{target}")] = "Minor"     # ALWAYS Minor
+        used_rows.add(target)
+        _log(f"  ➕ Extra '{measure}' → row {target} [{zone}] "
+             f"B='{desc}' C='{abbr}', Category=Minor")
+
+    # ===========================================================
+    # 3) Solar PV orientation / shading
+    # ===========================================================
     if spv_included:
         if orientation_direction:
             ws[get_master_cell(ws, "F22")] = orientation_direction
@@ -1376,24 +1693,31 @@ def write_sheet_7(ws, wb_data, df_specs, selected_measures, orientation_directio
         ws[get_master_cell(ws, "F22")] = None
         ws[get_master_cell(ws, "F23")] = None
 
-    condition_met = any(
-        ws[get_master_cell(ws, cell)].value not in (None, False, "", "FALSE")
-        for cell in ["A5", "A6", "A7", "A8", "A10", "A12", "A13"]
-    )
+    # ===========================================================
+    # 4) Major-works flags on sheet 4.0 (H3/H4)
+    # ===========================================================
+    major_fabric_keys = {"LI (B9)", "CWI", "EWI", "IWI", "FRI", "Windows", "Doors"}
+    condition_met = any(k in known_selected for k in major_fabric_keys)
     ws4["H3"].value = "Yes" if condition_met else "No"
     ws4["H4"].value = "Yes" if condition_met else "No"
 
+    # ===========================================================
+    # 5) Installation sequence (column G)
+    # ===========================================================
     seq_number = 1
     for group in SEQUENCE_ORDER:
-        group_has_content = False
-        for measure_name in group:
-            if measure_name not in measure_to_cell: continue
-            row_num = int(measure_to_cell[measure_name][1:])
-            if ws[get_master_cell(ws, f"D{row_num}")].value not in (None, ""):
-                ws[get_master_cell(ws, f"G{row_num}")] = seq_number
-                group_has_content = True
-        if group_has_content:
+        if any(name in known_selected for name in group):
+            for name in group:
+                if name in known_selected and name in measure_to_cell:
+                    row_num = int(measure_to_cell[name][1:])
+                    if row_num in renewable_extra_rows or row_num in fabric_extra_rows:
+                        continue
+                    ws[get_master_cell(ws, f"G{row_num}")] = seq_number
             seq_number += 1
+
+    for extra_row in renewable_extra_rows + fabric_extra_rows:
+        ws[get_master_cell(ws, f"G{extra_row}")] = seq_number
+        seq_number += 1
 
 # ================================================================
 # CORE PROCESSING FUNCTION
@@ -1404,7 +1728,7 @@ def process_property(
     cr_path, sn_path, epr_path,
     template_bytes,
     ss_token, sheet_id, property_master_sheet_id, second_sheet_id,
-    sheet10_b3, sheet10_f3,
+    local_authority_name, project_name, sheet10_f3,
     prelim_spec_col, construction_spec_col,
     log
 ):
@@ -1466,8 +1790,16 @@ def process_property(
         wildfire_risk     = ""
     else:
         log(f"✅ ADDRESS MATCH found in Smartsheet")
-        matched_address   = matched_row["Address"]
-        selected_measures = matched_row["Selected_Measures"]
+        matched_address   = matched_row.get("Address", "")
+        # Robust read: column may be "Selected_Measures" (after rename),
+        # "Select Measures" (original), or any column containing "measure".
+        if "Selected_Measures" in matched_row.index:
+            selected_measures = matched_row["Selected_Measures"]
+        elif "Select Measures" in matched_row.index:
+            selected_measures = matched_row["Select Measures"]
+        else:
+            _mcol = next((c for c in matched_row.index if "measure" in str(c).lower()), None)
+            selected_measures = matched_row[_mcol] if _mcol else ""
         property_id_value = matched_row.get("Property ID", "")
         sap_potential     = matched_row.get("Proposed Post SAP Score", "")
         sap_current       = matched_row.get("Pre SAP Score (Full SAP)", "")
@@ -1590,7 +1922,7 @@ def process_property(
     wb_data = {
         "dwelling_address":           dwelling_address,
         "property_id_value":          property_id_value,
-        "local_authority_name":       sheet10_b3,
+        "local_authority_name":       local_authority_name,   # -> 4.0 B5 only
         "sap_current":                sap_current,
         "sap_potential":              sap_potential,
         "tenure":                     tenure,
@@ -1620,14 +1952,15 @@ def process_property(
         "wildfire_risk":              wildfire_risk,
     }
 
-    # ── PRELIM OUTPUT — no climate risk, uses PRELIM spec column ──
+    # ── PRELIM OUTPUT — NOW WITH climate risk, uses PRELIM spec column ──
     log(f"📄 Building Prelim output (spec column: '{prelim_spec_col}')...")
     wb_prelim  = load_workbook(io.BytesIO(template_bytes))
     ws4_prelim = wb_prelim["4.0"]
     write_sheet_4_base(ws4_prelim, wb_data)
+    write_sheet_4_climate_risk(ws4_prelim, wb_data)   # NEW: climate risk now included in Prelim too
     ws7_prelim = wb_prelim["7.0"]
     write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim, spec_col=prelim_spec_col, log=log)
-    write_sheet_10(wb_prelim, sheet10_b3, sheet10_f3, log=log)
+    write_sheet_10(wb_prelim, project_name, sheet10_f3, log=log)
     insert_rooms_with_template(
         cr_pdf_path=cr_path, workbook=wb_prelim, sheet_name="11.0",
         insert_at_row=5, template_row=4, room_col_left="A", room_col_right="J",
@@ -1646,7 +1979,7 @@ def process_property(
     write_sheet_4_climate_risk(ws4_construction, wb_data)
     ws7_construction = wb_construction["7.0"]
     write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction, spec_col=construction_spec_col, log=log)
-    write_sheet_10(wb_construction, sheet10_b3, sheet10_f3, log=log)
+    write_sheet_10(wb_construction, project_name, sheet10_f3, log=log)
     insert_rooms_with_template(
         cr_pdf_path=cr_path, workbook=wb_construction, sheet_name="11.0",
         insert_at_row=5, template_row=4, room_col_left="A", room_col_right="J",
@@ -1696,6 +2029,16 @@ else:
 
 # ── SIDEBAR — Sheet IDs, Sheet 10 values, Spec columns, Template ──
 with st.sidebar:
+    st.markdown(
+        f'<span class="badge badge-brand">👤 {st.session_state.get("user_email", "")}</span>',
+        unsafe_allow_html=True,
+    )
+    if st.button("Log out"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+    st.markdown("---")
+
     st.markdown("### Configuration")
     st.markdown("")
 
@@ -1710,9 +2053,24 @@ with st.sidebar:
 
     st.markdown("---")
 
-    st.markdown("**Sheet 10 — Local Authority**")
-    sheet10_b3 = st.text_input("Local Authority Name (B3)", placeholder="e.g. Croydon Council", key="b3")
-    sheet10_f3 = st.text_input("REF (F3)", placeholder="e.g. 1024/CDN", key="f3")
+    st.markdown("**Local Authority**")
+    local_authority_name = st.text_input(
+        "Local Authority Name (4.0 B5)",
+        placeholder="e.g. Croydon Council",
+        key="local_authority",
+        help="Goes to Sheet 4.0 cell B5 only.",
+    )
+
+    st.markdown("---")
+
+    st.markdown("**Sheet 10 — Project Details**")
+    project_name = st.text_input(
+        "Project Name (10.0 B5)",
+        placeholder="e.g. Croydon Retrofit Phase 1",
+        key="project_name",
+        help="Goes to Sheet 10.0 cell B5.",
+    )
+    sheet10_f3 = st.text_input("REF (10.0 F3)", placeholder="e.g. 1024/CDN", key="f3")
 
     st.markdown("---")
 
@@ -1774,7 +2132,8 @@ with col_left:
         "IOE Sheet ID":          bool(sheet_id),
         "Property Master Sheet ID": bool(property_master_sheet_id),
         "Client Spec Sheet ID":  bool(second_sheet_id),
-        "Local Authority":       bool(sheet10_b3),
+        "Local Authority":       bool(local_authority_name),
+        "Project Name":          bool(project_name),
         "Prelim column":         bool(prelim_spec_col),
         "Construction column":   bool(construction_spec_col),
     }
@@ -1858,7 +2217,8 @@ if run_btn:
             sheet_id=int(sheet_id),
             property_master_sheet_id=int(property_master_sheet_id),
             second_sheet_id=int(second_sheet_id),
-            sheet10_b3=sheet10_b3,
+            local_authority_name=local_authority_name,
+            project_name=project_name,
             sheet10_f3=sheet10_f3,
             prelim_spec_col=prelim_spec_col,
             construction_spec_col=construction_spec_col,
@@ -1900,7 +2260,7 @@ if st.session_state.get("results_ready"):
             <div class="output-mini">
                 <div class="output-mini-icon">📄</div>
                 <div class="output-mini-title">Prelim Report</div>
-                <div class="output-mini-sub">No climate risk data</div>
+                <div class="output-mini-sub">Includes climate risk data</div>
             </div>
             """, unsafe_allow_html=True)
             st.download_button(
