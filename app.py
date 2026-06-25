@@ -112,7 +112,7 @@ def _get_smartsheet_token():
     return str(token).strip()
 
 SMARTSHEET_API_TOKEN = _get_smartsheet_token()
-#SMARTSHEET_API_TOKEN = "rWR95nWpa9TMOOs5GqELq8sugQT6QMeMLDwZu"  # Optional direct hardcode, not recommended for GitHub
+#SMARTSHEET_API_TOKEN = "SMARTSHEET_API_TOKEN"  # Optional direct hardcode, not recommended for GitHub
 
 # Put your Excel template here: assets/DESIGN EXPORT TEMPLATE.xlsx
 BUILTIN_TEMPLATE_PATH = Path(__file__).parent / "template" / "DESIGN EXPORT TEMPLATE.xlsx"
