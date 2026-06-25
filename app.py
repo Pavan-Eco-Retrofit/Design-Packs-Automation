@@ -102,7 +102,7 @@ LOGO_B64 = _load_logo_b64()
 # BUILT-IN FILES / SECRETS
 # ================================================================
 # Recommended: keep the token in .streamlit/secrets.toml as:
-SMARTSHEET_API_TOKEN = "rWR95nWpa9TMOOs5GqELq8sugQT6QMeMLDwZu"
+SMARTSHEET_API_TOKEN = SMARTSHEET_API_TOKEN
 # If you do not want to use secrets, paste the token between the quotes below.
 def _get_smartsheet_token():
     try:
