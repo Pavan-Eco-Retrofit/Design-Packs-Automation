@@ -102,7 +102,7 @@ LOGO_B64 = _load_logo_b64()
 # BUILT-IN FILES / SECRETS
 # ================================================================
 # Recommended: keep the token in .streamlit/secrets.toml as:
-SMARTSHEET_API_TOKEN = SMARTSHEET_API_TOKEN
+#SMARTSHEET_API_TOKEN = SMARTSHEET_API_TOKEN
 # If you do not want to use secrets, paste the token between the quotes below.
 def _get_smartsheet_token():
     try:
@@ -112,7 +112,7 @@ def _get_smartsheet_token():
     return str(token).strip()
 
 SMARTSHEET_API_TOKEN = _get_smartsheet_token()
-SMARTSHEET_API_TOKEN = "rWR95nWpa9TMOOs5GqELq8sugQT6QMeMLDwZu"  # Optional direct hardcode, not recommended for GitHub
+#SMARTSHEET_API_TOKEN = "rWR95nWpa9TMOOs5GqELq8sugQT6QMeMLDwZu"  # Optional direct hardcode, not recommended for GitHub
 
 # Put your Excel template here: assets/DESIGN EXPORT TEMPLATE.xlsx
 BUILTIN_TEMPLATE_PATH = Path(__file__).parent / "template" / "DESIGN EXPORT TEMPLATE.xlsx"
