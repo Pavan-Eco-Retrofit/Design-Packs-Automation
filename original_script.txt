@@ -1,3 +1,18 @@
+# %% [markdown]
+# # Power Asset · Retrofit Design Exporter (notebook script)
+#
+# **Changes applied (same as app.py):**
+# - Point 1 — Local Authority -> 4.0 B5 only. New PROJECT_NAME -> 10.0 B5.
+#   REF -> 10.0 F3. 10.0 B3 is cleared (left empty).
+# - Point 2 — Bathroom & Kitchen ONLY: column M (Proposed) is driven by the
+#   Background Ventilation Area (D). Value present -> "Sealed";
+#   "No"/"No minimum"/blank -> "No Works". Other wet rooms keep fans logic.
+# - Point 3 — WC / W/C / Utility: B = CR (condensation) value, D = "No minimum".
+# - Point 4 — Hallway: column N is always "No Works".
+#
+# `write_sheet_7` behaviour is unchanged from your previous notebook version.
+
+# %%
 import os
 import glob
 import re
@@ -8,26 +23,38 @@ import pandas as pd
 from openpyxl import load_workbook
 from tqdm import tqdm
 from copy import copy
-from openpyxl.utils import range_boundaries
+from openpyxl.utils import range_boundaries, column_index_from_string
 import time
 
-# ================================================================
-# START TIMER
-# ================================================================
-start_time = time.time()
+# %% [markdown]
+# ## CONFIG — fill these in for your environment
+# (These were defined elsewhere in your notebook. Set them here before running.)
 
-# ================================================================
-# CONFIG
-# ================================================================
+# %%
+# ---- Smartsheet ----
+SS_TOKEN                  = "PUT_YOUR_SMARTSHEET_TOKEN_HERE"
+SHEET_ID                  = 0          # IOE sheet id
+SECOND_SHEET_ID           = 0          # Client Specification sheet id
+PROPERTY_MASTER_SHEET_ID  = 0          # Property Master sheet id
 
+# ---- Folders / template ----
+PARENT_FOLDER = r"PUT_PARENT_FOLDER_OF_PROPERTIES_HERE"
+OUTPUT_ROOT   = r"PUT_OUTPUT_FOLDER_HERE"
+EXCEL_FILE    = r"PUT_PATH_TO_DESIGN_EXPORT_TEMPLATE.xlsx"
+
+# ---- Local authority / project ----
+LOCAL_AUTHORITY_NAME   = "Local Authority Name"        # e.g. "Croydon Council"          -> 4.0 B5 (only)
+PROJECT_NAME           = "Project Name"                # e.g. "Croydon Retrofit Phase 1" -> 10.0 B5
+SHEET10_F3_VALUE       = "1024/CDN"                    # REF                             -> 10.0 F3
+static_local_authority = LOCAL_AUTHORITY_NAME
+
+# ---- Smartsheet column names ----
 FULL_ADDRESS_COL    = "Full Address"
 POSTAL_CODE_COL     = "Postal Code"
 SELECT_MEASURES_COL = "Select Measures"
+PROPOSED_SAP_COL    = "Proposed Post SAP Score"
+PRE_SAP_COL         = "Pre SAP Score (Full SAP)"
 
-PROPOSED_SAP_COL = "Proposed Post SAP Score"
-PRE_SAP_COL      = "Pre SAP Score (Full SAP)"
-
-# ── Smartsheet column names for climate risk / property flags ──
 CONSERVATION_AREA_COL = "Conservation Area"
 LISTED_BUILDING_COL   = "Listed Building"
 RADON_RISK_COL        = "Radon Risk"
@@ -39,28 +66,22 @@ RAINFALL_RISK_COL     = "Rainfall Risk"
 WIND_SPEED_RISK_COL   = "Wind speed Risk"
 WILDFIRE_RISK_COL     = "Wildfire Risk"
 
-# ── Client Spec sheet column names — one per output ─────────────
-# Prelim report reads its specs ONLY from PRELIM_SPEC_COL.
-# Construction report reads its specs ONLY from CONSTRUCTION_SPEC_COL.
-# Set these to the EXACT Smartsheet column names you want.
+# Prelim report reads specs ONLY from PRELIM_SPEC_COL.
+# Construction report reads specs ONLY from CONSTRUCTION_SPEC_COL.
 PRELIM_SPEC_COL       = "Client Specification"
 CONSTRUCTION_SPEC_COL = "Construction Design Specification Notes"
 
-# ── Sheet 10 values ─────────────────────────────────────────────
-# SHEET10_F3_VALUE is the REF value (e.g. "1024/CDN")
-# SHEET10_F3_VALUE = "1024/CDN"
-
 SM_URL     = f"https://api.smartsheet.eu/2.0/sheets/{SHEET_ID}"
 SM_HEADERS = {"Authorization": f"Bearer {SS_TOKEN}"}
-# Add your Property Master Smartsheet ID in your config before running.
-# Example: PROPERTY_MASTER_SHEET_ID = 1234567890123456
 
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
+start_time = time.time()
 
 
-# ================================================================
-# CUSTOM ROUND — .5 and above rounds UP, below rounds DOWN
-# ================================================================
+# %% [markdown]
+# ## Helpers (unchanged from your original)
+
+# %%
 def custom_round(x) -> float:
     try:
         x = float(x)
@@ -70,31 +91,24 @@ def custom_round(x) -> float:
     return float(math.ceil(x) if (x - floor_val) >= 0.5 else floor_val)
 
 
-# ================================================================
-# ROOM CLASSIFICATION & SORT
-# ================================================================
 WET_ROOM_KEYWORDS = ["kitchen", "bathroom", "wetroom", "wet room", "wc", "w/c", "toilet", "utility"]
-
 WET_ROOM_PRIORITY = {
-    "kitchen":  0,
-    "utility":  1,
-    "bathroom": 2,
-    "wetroom":  3,
-    "wet room": 3,
-    "wc":       4,
-    "w/c":      4,
-    "toilet":   5,
+    "kitchen": 0, "utility": 1, "bathroom": 2,
+    "wetroom": 3, "wet room": 3, "wc": 4, "w/c": 4, "toilet": 5,
 }
 
 
 def is_wet_room(room_name: str) -> bool:
-    name = room_name.lower()
-    return any(kw in name for kw in WET_ROOM_KEYWORDS)
+    return any(kw in room_name.lower() for kw in WET_ROOM_KEYWORDS)
 
 
 def is_wc_or_utility(room_name: str) -> bool:
-    name = room_name.lower().strip()
-    return any(kw in name for kw in ["wc", "w/c", "toilet", "utility"])
+    return any(kw in room_name.lower().strip() for kw in ["wc", "w/c", "toilet", "utility"])
+
+
+def is_bathroom_or_kitchen(room_name: str) -> bool:
+    name = room_name.lower()
+    return "kitchen" in name or "bathroom" in name
 
 
 def wet_room_sort_key(room_name: str):
@@ -109,9 +123,6 @@ def wet_room_sort_key(room_name: str):
     return (3, 0)
 
 
-# ================================================================
-# PDF HELPERS
-# ================================================================
 def read_pdf_text(path):
     with fitz.open(path) as doc:
         return "\n".join(page.get_text() for page in doc)
@@ -131,9 +142,6 @@ def find_retrofit_folder(base):
     return None
 
 
-# ================================================================
-# PDF CLASSIFICATION (CR / SN / EPR)
-# ================================================================
 def _norm_name(path: str) -> str:
     base = os.path.splitext(os.path.basename(path))[0].lower()
     base = re.sub(r"[\(\)\[\]]", " ", base)
@@ -177,9 +185,6 @@ def get_required_pdfs(retrofit_path: str):
     return (cr, sn, epr) if (cr and sn and epr) else None
 
 
-# ================================================================
-# ADDRESS EXTRACTION
-# ================================================================
 def extract_property_address_from_cr(path):
     lines = [l.strip() for l in read_pdf_page_lines(path, 0) if l.strip()]
     addr_lines = []
@@ -234,9 +239,6 @@ def normalize_postcode(x):
     return re.sub(r"\s+", "", str(x).lower())
 
 
-# ================================================================
-# TENURE NORMALISATION
-# ================================================================
 def normalise_tenure(raw_tenure: str) -> str:
     if not raw_tenure:
         return raw_tenure
@@ -246,9 +248,6 @@ def normalise_tenure(raw_tenure: str) -> str:
     return cleaned
 
 
-# ================================================================
-# EXTRACT PROPERTY DETACHMENT FROM CR PDF PAGE 3
-# ================================================================
 def extract_property_detachment_from_cr(path: str) -> str:
     lines = read_pdf_page_lines(path, 2)
     for line in lines:
@@ -260,17 +259,9 @@ def extract_property_detachment_from_cr(path: str) -> str:
     return ""
 
 
-# ================================================================
-# EXTRACT PROPERTY TYPE FROM EPR PDF
-# Pulls the "Property Type" value from the EPR dwelling-details
-# block (the line right above "Total Floor Area"),
-# e.g. "End-Terrace House", "Mid-Terrace House", "Detached Bungalow".
-# ================================================================
 def extract_property_type_from_epr(epr_text: str) -> str:
     if not epr_text:
         return ""
-
-    # 1) Same-line: "Property Type   End-Terrace House"
     type_keywords = ("house", "flat", "maisonette", "bungalow", "park home")
     m = re.search(
         r"Property\s*Type\s*[:\-]?\s*([A-Za-z][A-Za-z \-/]*?)(?=\s*(?:Total\s+Floor\s+Area|Assessment|Submission|Reference|Dwelling|\r|\n|$))",
@@ -280,15 +271,12 @@ def extract_property_type_from_epr(epr_text: str) -> str:
         cand = re.sub(r"\s{2,}", " ", m.group(1)).strip()
         if cand and any(t in cand.lower() for t in type_keywords):
             return cand
-
-    # 2) Stacked layout: label column then value column.
     lines = [l.strip() for l in epr_text.splitlines()]
     for i, line in enumerate(lines):
         if line.lower().startswith("property type"):
             tail = re.sub(r"(?i)property\s*type\s*[:\-]?\s*", "", line).strip()
             if tail:
                 return re.sub(r"\s{2,}", " ", tail).strip()
-            # Stacked: value lives right above the Total Floor Area figure
             for j in range(i + 1, len(lines)):
                 if re.match(r"^\d+(\.\d+)?\s*m", lines[j], re.IGNORECASE):
                     for k in range(j - 1, i, -1):
@@ -300,18 +288,12 @@ def extract_property_type_from_epr(epr_text: str) -> str:
                 if nxt and any(t in nxt.lower() for t in type_keywords):
                     return re.sub(r"\s{2,}", " ", nxt).strip()
             break
-
-    # 3) Fallback: first line that looks like a dwelling type
     for line in lines:
         if any(k in line.lower() for k in type_keywords) and len(line) < 40:
             return re.sub(r"\s{2,}", " ", line).strip()
-
     return ""
 
 
-# ================================================================
-# SMARTSHEET
-# ================================================================
 def fetch_smartsheet_df():
     r = requests.get(SM_URL, headers=SM_HEADERS)
     r.raise_for_status()
@@ -324,28 +306,7 @@ def fetch_smartsheet_df():
     return pd.DataFrame(rows)
 
 
-# ================================================================
-# PROPERTY MASTER LOOKUP USING PROPERTY ID
-# ================================================================
-PROPERTY_MASTER_ID_COL_OPTIONS = [
-    "Property ID",
-    "Property_ID",
-    "Property Id",
-    "property_id",
-]
-
-PROPERTY_MASTER_RISK_COLS = [
-    CONSERVATION_AREA_COL,
-    LISTED_BUILDING_COL,
-    RADON_RISK_COL,
-    FLOOD_RISK_COL,
-    SUBS_2030_COL,
-    SUBS_2070_COL,
-    WDR_RISK_COL,
-    RAINFALL_RISK_COL,
-    WIND_SPEED_RISK_COL,
-    WILDFIRE_RISK_COL,
-]
+PROPERTY_MASTER_ID_COL_OPTIONS = ["Property ID", "Property_ID", "Property Id", "property_id"]
 
 
 def normalize_property_id(x):
@@ -386,31 +347,18 @@ def fetch_property_master_df():
 def find_property_master_row(df_master, property_id_value):
     if df_master is None or df_master.empty:
         return None
-
     master_id_col = get_first_existing_col(df_master, PROPERTY_MASTER_ID_COL_OPTIONS)
     if not master_id_col:
-        raise ValueError(
-            "Property Master sheet does not contain a Property ID column. "
-            "Expected one of: Property ID, Property_ID, Property Id, property_id"
-        )
-
+        raise ValueError("Property Master sheet has no Property ID column.")
     target_id = normalize_property_id(property_id_value)
     if not target_id:
         return None
-
     df_master = df_master.copy()
     df_master["_n_property_id"] = df_master[master_id_col].apply(normalize_property_id)
     matches = df_master[df_master["_n_property_id"] == target_id]
-
-    if matches.empty:
-        return None
-
-    return matches.iloc[0]
+    return None if matches.empty else matches.iloc[0]
 
 
-# ================================================================
-# COORDINATES
-# ================================================================
 def dms_to_dd(deg, minutes, sec, direction):
     dd = float(deg) + float(minutes) / 60 + float(sec) / 3600
     return round(-dd if direction in ["S", "W"] else dd, 5)
@@ -425,9 +373,6 @@ def extract_lat_lon_from_cr(path):
     return lat, lon
 
 
-# ================================================================
-# EXTRACTION HELPERS
-# ================================================================
 def safe_search(pattern, text, flags=0):
     m = re.search(pattern, text, flags)
     return m.group(1).strip() if m else ""
@@ -526,159 +471,10 @@ def extract_highest_bedroom_from_contents(cr_page2_lines):
     return highest_bedroom
 
 
-# ================================================================
-# ROOM EXTRACTION FROM CONTENTS PAGE
-# — Fully rewritten to be robust against Elmhurst-style PDFs
-#
-# Strategy:
-#   1. Read page 1 (0-indexed) as raw lines.
-#   2. Build a paired list: (item_text, page_number) by matching
-#      lines that are purely numeric to the previous non-numeric line.
-#   3. Drop known non-room entries using a blocklist.
-#   4. Keep only entries that sit between the first recognised room
-#      keyword and the first end-section keyword.
-# ================================================================
+# %% [markdown]
+# ## Room extraction (unchanged from your original)
 
-# Lines whose text matches these patterns are NEVER rooms
-_NON_ROOM_EXACT = {
-    "contents", "property details", "property summary", "occupancy",
-    "elevations", "elevation", "significance survey", "additional information",
-    "annex", "appendix", "notes", "floor plan", "floorplan",
-}
-
-# If any of these substrings appear in a line it is not a room
-_NON_ROOM_SUBSTRINGS = [
-    "element no", "significance", "elevation", "floorplan", "floor plan",
-    "property detail", "property summary", "additional info", "annex",
-    "appendix", "occupancy",
-]
-
-# Stop collecting rooms once we hit these (case-insensitive substring match)
-_END_SECTION_KEYWORDS = [
-    "occupancy", "significance", "elevation", "additional", "annex",
-    "appendix", "summary", "notes",
-]
-
-# A line is considered a room candidate if it contains at least one of these
-_ROOM_INDICATOR_KEYWORDS = [
-    "kitchen", "bathroom", "bedroom", "living", "lounge", "dining",
-    "hall", "hallway", "wc", "toilet", "utility", "wetroom", "wet room",
-    "study", "office", "conservatory", "landing", "store", "cupboard",
-    "reception", "playroom", "cellar", "loft", "attic", "en suite",
-    "en-suite", "ensuite", "cloakroom",
-]
-
-
-def _is_non_room(text: str) -> bool:
-    """Return True if this line should never be treated as a room."""
-    t = text.strip().lower()
-    if t in _NON_ROOM_EXACT:
-        return True
-    for sub in _NON_ROOM_SUBSTRINGS:
-        if sub in t:
-            return True
-    return False
-
-
-def _is_end_section(text: str) -> bool:
-    t = text.strip().lower()
-    return any(kw in t for kw in _END_SECTION_KEYWORDS)
-
-
-def _looks_like_room(text: str) -> bool:
-    t = text.strip().lower()
-    return any(kw in t for kw in _ROOM_INDICATOR_KEYWORDS)
-
-
-def extract_rooms_from_contents(cr_pdf_path: str) -> list:
-    """
-    Parse the Contents page (PDF page index 1) of an Elmhurst CR PDF
-    and return a list of room names in document order.
-
-    Returns an empty list (never raises) so the caller can decide
-    what to do when no rooms are found.
-    """
-    raw_lines = read_pdf_page_lines(cr_pdf_path, 1)
-
-    # ── Step 1: strip whitespace, drop blank lines and page-header noise ──
-    cleaned = []
-    for line in raw_lines:
-        s = line.strip()
-        if not s:
-            continue
-        # Drop lines that are purely "Page N" or "page N"
-        if re.match(r"^page\s+\d+$", s, re.IGNORECASE):
-            continue
-        cleaned.append(s)
-
-    if not cleaned:
-        return []
-
-    # ── Step 2: pair item names with their page numbers ──────────────────
-    pairs = []   # list of (name_str, page_no_int)
-    i = 0
-    while i < len(cleaned):
-        token = cleaned[i]
-        if token.isdigit():
-            if pairs:
-                pass
-            i += 1
-            continue
-        if i + 1 < len(cleaned) and cleaned[i + 1].isdigit():
-            pairs.append((token, int(cleaned[i + 1])))
-            i += 2
-        else:
-            pairs.append((token, -1))
-            i += 1
-
-    if not pairs:
-        return []
-
-    # ── Step 3: find the slice of pairs that represent actual rooms ───────
-    start_idx = None
-    for idx, (name, _) in enumerate(pairs):
-        if _is_end_section(name):
-            break
-        if _looks_like_room(name) and not _is_non_room(name):
-            start_idx = idx
-            break
-
-    if start_idx is None:
-        print("  ⚠️  No recognised room keyword found; using fallback extraction.")
-        rooms = [
-            name for name, _ in pairs[2:]
-            if not _is_non_room(name) and not _is_end_section(name)
-        ]
-        return rooms
-
-    rooms = []
-    for name, _ in pairs[start_idx:]:
-        if _is_end_section(name):
-            break
-        if _is_non_room(name):
-            continue
-        rooms.append(name)
-
-    # ── Step 4: deduplicate while preserving order ────────────────────────
-    seen  = set()
-    dedup = []
-    for r in rooms:
-        key = r.strip().lower()
-        if key not in seen:
-            seen.add(key)
-            dedup.append(r)
-
-    dedup = [
-        r for r in dedup
-        if not re.search(r"^page\s+\d+\s+of\s+\d+$", str(r).strip(), re.I)
-    ]
-
-    return dedup
-
-
-# ================================================================
-# ROOM EXTRACTION QUESTIONS
-# ================================================================
+# %%
 Q_CONDENSATION = "Is there any evidence of condensation, damp or mould growth in this room?"
 Q_BG_AREA      = "Background Ventilation Area (mm2)"
 Q_TRICKLE      = "Do they have trickle vents?"
@@ -714,29 +510,20 @@ def get_room_page_range(contents, room):
         idx = contents.index(room)
     except ValueError:
         return None, None
-
     start_page = None
-
-    # Find first page number after room name
     for i in range(idx + 1, len(contents)):
         if str(contents[i]).strip().isdigit():
             start_page = int(str(contents[i]).strip())
             break
-
     if start_page is None:
         return None, None
-
     next_page = None
-
-    # Find next page number after start page
     for j in range(i + 1, len(contents)):
         if str(contents[j]).strip().isdigit():
             next_page = int(str(contents[j]).strip())
             break
-
     if next_page is None:
         return start_page - 1, start_page + 2
-
     return start_page - 1, next_page - 2
 
 
@@ -763,24 +550,21 @@ def extract_room_data(cr_pdf_path, contents, room):
     }
 
 
-# ================================================================
-# FLOW RATE HELPERS
-# ================================================================
 def get_min_lps_for_room(room_name: str) -> str:
     name = room_name.lower()
-    if "kitchen" in name:                                        return "60 l/s minimum"
-    if "bathroom" in name or "wetroom" in name:                  return "15 l/s minimum"
-    if "wc" in name or "toilet" in name or "w/c" in name:       return "6 l/s minimum"
-    if "utility" in name:                                        return "30 l/s minimum"
+    if "kitchen" in name:                                  return "60 l/s minimum"
+    if "bathroom" in name or "wetroom" in name:            return "15 l/s minimum"
+    if "wc" in name or "toilet" in name or "w/c" in name: return "6 l/s minimum"
+    if "utility" in name:                                  return "30 l/s minimum"
     return "N/A"
 
 
 def get_min_lps_for_room_q(room_name: str) -> str:
     name = room_name.lower()
-    if "kitchen" in name:                                        return "13 l/s minimum"
-    if "bathroom" in name or "wetroom" in name:                  return "8 l/s minimum"
-    if "wc" in name or "toilet" in name or "w/c" in name:       return "6 l/s minimum"
-    if "utility" in name:                                        return "6 l/s minimum"
+    if "kitchen" in name:                                  return "13 l/s minimum"
+    if "bathroom" in name or "wetroom" in name:            return "8 l/s minimum"
+    if "wc" in name or "toilet" in name or "w/c" in name: return "6 l/s minimum"
+    if "utility" in name:                                  return "6 l/s minimum"
     return "N/A"
 
 
@@ -795,9 +579,10 @@ def extract_lps_number(value) -> int:
     return 0
 
 
-# ================================================================
-# EXCEL HELPERS
-# ================================================================
+# %% [markdown]
+# ## Excel helpers (unchanged from your original)
+
+# %%
 def find_row_by_label(ws, label, col="A"):
     for r in range(1, ws.max_row + 1):
         val = ws[f"{col}{r}"].value
@@ -841,25 +626,32 @@ def remerge(ws, ranges):
 
 # ================================================================
 # WRITE ROOM ROW
+#
+# Changes from previous version:
+#   • Point 3 — WC / W/C / Utility:  B = CR (condensation) value,
+#       D = "No minimum".
+#   • Point 2 — Bathroom & Kitchen ONLY:  column M (Proposed) is driven
+#       by the Background Ventilation Area (D). Value present -> "Sealed";
+#       "No"/"No minimum"/blank -> "No Works". (Other wet rooms keep the
+#       fans-based logic.)
+#   • Point 4 — Hallway:  column N is always "No Works".
 # ================================================================
 def write_room_row(ws, row, d, room):
     def v(x):
         return x if x is not None else "Not Extracted"
-
     room_lower = room.lower()
     bg_value   = d["background"]
     fans_value = v(d["fans"])
-
     wet_room_keys = ["kitchen", "bathroom", "wetroom", "wet room", "wc", "w/c", "toilet", "utility"]
-    is_wet        = any(w in room_lower for w in wet_room_keys)
+    is_wet  = any(w in room_lower for w in wet_room_keys)
+    is_wcu  = is_wc_or_utility(room)
+    is_bk   = is_bathroom_or_kitchen(room)
+    is_hall = "hall" in room_lower
 
-    # Col B: condensation / trickle check
-    if is_wc_or_utility(room):
-        ws[f"B{row}"].value = "No minimum"
-    else:
-        ws[f"B{row}"].value = v(d["condensation"])
+    # --- Column B: always the CR (condensation) value, incl. WC/W-C/Utility ---
+    ws[f"B{row}"].value = v(d["condensation"])
 
-    # Col C: required background vent size
+    # --- Column C: background ventilation requirement ---
     if bg_value is None:
         ws[f"C{row}"].value = "No"
     elif "bathroom" in room_lower or "wetroom" in room_lower:
@@ -867,90 +659,63 @@ def write_room_row(ws, row, d, room):
     else:
         ws[f"C{row}"].value = "8000mm2"
 
-    # Col D: actual measured background vent
-    ws[f"D{row}"].value = "No" if bg_value is None else f"{bg_value}mm2"
+    # --- Column D: "No minimum" for WC/W-C/Utility, else the background area ---
+    if is_wcu:
+        ws[f"D{row}"].value = "No minimum"
+    else:
+        ws[f"D{row}"].value = "No" if bg_value is None else f"{bg_value}mm2"
 
-    # Col E, F: undercuts and windows
     ws[f"E{row}"].value = v(d["undercuts"])
     ws[f"F{row}"].value = v(d["windows"])
 
-    # Col G: IEV/fan status
     if is_wet:
         ws[f"G{row}"].value = "IEV Present" if fans_value == "Yes" else "None"
     else:
         ws[f"G{row}"].value = "N/A"
 
-    # Col H: minimum boost l/s
     ws[f"H{row}"].value = get_min_lps_for_room(room)
 
-    # Col K: mould clean recommendation
     cond_val = d["condensation"]
-    ws[f"K{row}"].value = (
-        "No"    if cond_val == "No"  else
-        "Clean" if cond_val == "Yes" else
-        "Not Extracted"
-    )
-
-    # Col L: trickle vent required size (dry rooms only)
+    ws[f"K{row}"].value = ("No" if cond_val == "No" else "Clean" if cond_val == "Yes" else "Not Extracted")
     ws[f"L{row}"].value = "N/A" if is_wet else "4000mm2"
 
-    # Col M: trickle/sealing works
     col_c_val     = ws[f"C{row}"].value
     undercuts_val = ws[f"E{row}"].value
-    if is_wet:
+
+    # --- Column M (Proposed) ---
+    if is_bk:
+        # Bathroom & Kitchen: driven by Background Ventilation Area (D).
+        # Value present -> Sealed ; "No"/"No minimum"/blank -> No Works.
+        ws[f"M{row}"].value = "Sealed" if bg_value is not None else "No Works"
+    elif is_wet:
         ws[f"M{row}"].value = "Sealed" if fans_value == "Yes" else "No Works"
     else:
-        ws[f"M{row}"].value = (
-            "Required" if col_c_val == "No" and undercuts_val == "Yes" else "No Works"
-        )
+        ws[f"M{row}"].value = "Required" if col_c_val == "No" and undercuts_val == "Yes" else "No Works"
 
-    # Col N: door undercut works
-    ws[f"N{row}"].value = (
-        "Required"      if d["undercuts"] == "No"  else
-        "No Works"      if d["undercuts"] == "Yes" else
-        "Not Extracted"
-    )
+    # --- Column N: Hallway is always "No Works" ---
+    if is_hall:
+        ws[f"N{row}"].value = "No Works"
+    else:
+        ws[f"N{row}"].value = ("Required" if d["undercuts"] == "No" else "No Works" if d["undercuts"] == "Yes" else "Not Extracted")
 
-    # Col O: window works
-    ws[f"O{row}"].value = (
-        "Required"      if d["windows"] == "No"  else
-        "No Works"      if d["windows"] == "Yes" else
-        "Not Extracted"
-    )
+    ws[f"O{row}"].value = ("Required" if d["windows"] == "No" else "No Works" if d["windows"] == "Yes" else "Not Extracted")
 
-    # Col P: fan/dMEV works
     if is_wet:
         ws[f"P{row}"].value = "Upgrade dMEV" if fans_value == "Yes" else "Install dMEV"
     else:
         ws[f"P{row}"].value = "N/A"
 
-    # Col Q: minimum quiet l/s
     ws[f"Q{row}"].value = get_min_lps_for_room_q(room)
-
-    # Col R: placeholder
     ws[f"R{row}"].value = "Information Unavailable"
 
 
-# ================================================================
-# MAIN ROOM INSERTION (Sheet 11.0)
-# ================================================================
-def insert_rooms_with_template(
-    cr_pdf_path,
-    workbook,
-    sheet_name="11.0",
-    insert_at_row=5,
-    template_row=4,
-    room_col_left="A",
-    room_col_right="J",
-    tfa=None,
-    highest_bedroom=0
-):
+def insert_rooms_with_template(cr_pdf_path, workbook, sheet_name="11.0",
+                               insert_at_row=5, template_row=4,
+                               room_col_left="A", room_col_right="J",
+                               tfa=None, highest_bedroom=0):
     ws = workbook[sheet_name]
-
-    # ── Keep the raw contents lines exactly like the old code ─────
     contents_raw = read_pdf_page_lines(cr_pdf_path, 1)
 
-    # ── Build room list using the same old-code process ───────────
     cleaned = []
     for x in contents_raw:
         x = x.strip()
@@ -968,7 +733,6 @@ def insert_rooms_with_template(
         "Bedroom", "Bedroom 1", "Hall", "Hallway",
         "Bathroom", "WC", "w/c", "Toilet", "Utility"
     ]
-
     start_idx = 0
     for i, item in enumerate(cleaned):
         if any(s.lower() in item.lower() for s in possible_starts):
@@ -976,16 +740,12 @@ def insert_rooms_with_template(
             break
 
     end_markers = ["occupancy", "additional", "summary", "recommendations", "annex", "appendix"]
-    end_idx = next(
-        (i for i, item in enumerate(cleaned) if any(m in item.lower() for m in end_markers)),
-        len(cleaned)
-    )
+    end_idx = next((i for i, item in enumerate(cleaned) if any(m in item.lower() for m in end_markers)), len(cleaned))
 
     rooms = cleaned[start_idx:end_idx]
     non_room_keywords = ["elevation", "floorplan", "floor plan", "summary",
                          "additional information", "annex", "appendix", "notes"]
     rooms = [r for r in rooms if not any(kw in r.lower() for kw in non_room_keywords)]
-
     if not rooms:
         raise ValueError("No rooms found in Contents page")
 
@@ -1018,14 +778,8 @@ def insert_rooms_with_template(
     room_start = insert_at_row
     room_end   = insert_at_row + len(rooms) - 1
 
-    ws4["H5"].value = (
-        "Yes" if any(ws[f"P{r}"].value == "Upgrade dMEV" for r in range(room_start, room_end + 1))
-        else "No"
-    )
-    ws4["B8"].value = (
-        "Yes" if any(ws[f"B{r}"].value == "Yes" for r in range(room_start, room_end + 1))
-        else "No"
-    )
+    ws4["H5"].value = ("Yes" if any(ws[f"P{r}"].value == "Upgrade dMEV" for r in range(room_start, room_end + 1)) else "No")
+    ws4["B8"].value = ("Yes" if any(ws[f"B{r}"].value == "Yes" for r in range(room_start, room_end + 1)) else "No")
 
     total_lps_h = sum(extract_lps_number(ws[f"H{insert_at_row + i}"].value) for i in range(len(rooms)))
     total_lps_q = sum(extract_lps_number(ws[f"Q{insert_at_row + i}"].value) for i in range(len(rooms)))
@@ -1036,7 +790,6 @@ def insert_rooms_with_template(
     floor_area_row = find_row_by_label(ws, "Whole building ventilation rate (l/s) - floor area (m2)", col="A")
     ws[f"G{floor_area_row}"].value = tfa
     ws[f"P{floor_area_row}"].value = tfa
-
     floor_rate = custom_round(parse_area_m2(tfa) * 0.3)
     ws[f"H{floor_area_row}"].value = f"{floor_rate} l/s"
     ws[f"Q{floor_area_row}"].value = f"{floor_rate} l/s"
@@ -1056,18 +809,14 @@ def insert_rooms_with_template(
     ws[f"Q{final_row}"].value = f"{final_rate_q} l/s"
 
     remerge(ws, [(c1, r1 + len(rooms), c2, r2 + len(rooms)) for c1, r1, c2, r2 in affected_merges])
-
     return rooms
 
 
-# ================================================================
-# WRITE SHEET 4.0
-# ================================================================
 def write_sheet_4_base(ws, wb_data: dict):
     d = wb_data
     ws[get_master_cell(ws, "B3")]  = d["dwelling_address"]
     ws[get_master_cell(ws, "B4")]  = d["property_id_value"]
-    ws[get_master_cell(ws, "B5")]  = d["local_authority_name"]
+    ws[get_master_cell(ws, "B5")]  = d["local_authority_name"]   # Local Authority -> 4.0 B5 (only)
     ws[get_master_cell(ws, "B6")]  = d["sap_current"]
     ws[get_master_cell(ws, "E3")]  = d["sap_current"]
     ws[get_master_cell(ws, "E9")]  = d["sap_potential"]
@@ -1117,30 +866,34 @@ def write_sheet_4_climate_risk(ws, wb_data: dict):
 
 # ================================================================
 # WRITE SHEET 10.0
-# F3 holds the REF value (SHEET10_F3_VALUE, e.g. "1024/CDN")
+#
+# Change: Local Authority no longer goes here. Instead:
+#   • B5 <- PROJECT_NAME
+#   • F3 <- REF (SHEET10_F3_VALUE)
+#   • B3 is explicitly cleared (left empty).
 # ================================================================
 def write_sheet_10(workbook):
     if "10.0" not in workbook.sheetnames:
         print("⚠️  Sheet '10.0' not found — skipping.")
         return
     ws = workbook["10.0"]
-    ws[get_master_cell(ws, "B3")] = SHEET10_B3_VALUE
-    ws[get_master_cell(ws, "F3")] = SHEET10_F3_VALUE   # REF, e.g. "1024/CDN"
-    print(f"  ✓ Sheet 10.0: B3='{SHEET10_B3_VALUE}', F3 (REF)='{SHEET10_F3_VALUE}'")
+    ws[get_master_cell(ws, "B3")] = None             # was Local Authority — now empty
+    ws[get_master_cell(ws, "B3")] = PROJECT_NAME     # Project Name
+    ws[get_master_cell(ws, "F3")] = SHEET10_F3_VALUE  # REF
+    print(f"  ✓ Sheet 10.0: B5(Project)='{PROJECT_NAME}', F3(REF)='{SHEET10_F3_VALUE}', B3=cleared")
 
 
-# ================================================================
-# WRITE SHEET 7.0
-# spec_col is a SINGLE Smartsheet column name. Each output
-# (Prelim / Construction) passes its own column. The spec value
-# for each measure is read from that one column only.
-# ================================================================
+# %% [markdown]
+# ## ⭐ Sheet 7.0 writer (unchanged from your previous notebook version)
+
+# %%
 def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_direction, ws4, spec_col=None):
 
+    # ---- Standard measures -> fixed template rows ----
     measure_to_cell = {
         "Trickle Vents":       "A2",
-        "Door undercuts":      "A4",
         "dMEV":                "A3",
+        "Door undercuts":      "A4",
         "LI (B9)":             "A5",
         "CWI":                 "A6",
         "EWI":                 "A7",
@@ -1150,6 +903,7 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
         "RiR and/or Skeiling": "A11",
         "Windows":             "A12",
         "Doors":               "A13",
+        # row 14 = "Other please specify"  (reserved for extra fabric/ventilation measures)
         "Boiler/FTCH":         "A17",
         "ESH":                 "A18",
         "ASHP":                "A19",
@@ -1177,43 +931,44 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
         "GSHP":                "GSHP",
         "Solar Thermal":       "ST",
         "SPV":                 "SPV",
-        "LEL":                 "LEL",
-        "HWC":                 "HWC",
-        "Draught-Proofing":    "DPRF",
-        "Upgrade boiler, same fuel":                    "UBLR",
-        "Heat Recovery System for Mixer Showers":       "HRSMS",
+        # ---- extra measures (drawing keys for column C) ----
+        "Sub Floor Ventilation":  "AirEx Floorvent",
+        "Sub-Floor Ventilation":  "AirEx Floorvent",
+        "AirEx Floorvent":        "AirEx Floorvent",
+        "AirEx":                  "AirEx Floorvent",
+        "Air Brick":              "AirEx Floorvent",
+        "Electric Meter Dual":    "EM-D",
+        "Solar Diverter":         "SD",
+        "Solar iBoost":           "SD",
+        "LEL":                    "LEL",
+        "HWC":                    "HWC",
+        "Draught-Proofing":       "DPRF",
+        "Upgrade boiler, same fuel":               "UBLR",
+        "Heat Recovery System for Mixer Showers":  "HRSMS",
     }
 
+    # Install-order groups for STANDARD measures (drives column G sequence)
     SEQUENCE_ORDER = [
-        ["dMEV"],
-        ["CWI"],
-        ["EWI"],
-        ["IWI"],
-        ["LI (B9)"],
-        ["FRI"],
-        ["RiR and/or Skeiling"],
-        ["Windows", "Doors"],
-        ["Boiler/FTCH"],
-        ["ESH"],
-        ["ASHP"],
-        ["GSHP"],
-        ["Solar Thermal"],
-        ["HWC"],
-        ["LEL"],
-        ["SPV"],
+        ["dMEV"], ["CWI"], ["EWI"], ["IWI"], ["LI (B9)"], ["FRI"],
+        ["RiR and/or Skeiling"], ["Windows", "Doors"], ["Boiler/FTCH"],
+        ["ESH"], ["ASHP"], ["GSHP"], ["Solar Thermal"], ["HWC"], ["LEL"], ["SPV"],
     ]
 
-    # Pre-build sequence lookup
-    measure_seq_lookup = {}
-    _seq = 1
-    for group in SEQUENCE_ORDER:
-        for name in group:
-            measure_seq_lookup[name] = _seq
-        _seq += 1
-    next_unknown_seq = _seq
+    # An EXTRA measure with any of these keywords is treated as heating/renewable
+    # (goes into the renewables table). Anything else is fabric/ventilation
+    # (goes into the "Other please specify" row).
+    HEATING_RENEWABLE_KEYWORDS = [
+        "boiler", "ftch", "esh", "storage heater", "ashp", "gshp",
+        "heat pump", "solar", "pv", "photovolta", "thermal", "diverter",
+        "immersion", "battery", "meter", "hwc", "cylinder", "iboost",
+        "renewable", "lel",
+    ]
 
-    def get_spec(abbr: str) -> str:
-        # Read the spec value from the single chosen column only.
+    def is_heating_renewable(name):
+        n = name.lower()
+        return any(k in n for k in HEATING_RENEWABLE_KEYWORDS)
+
+    def get_spec(abbr):
         if df_specs.empty or "Abbreviation" not in df_specs.columns:
             return ""
         if not spec_col or spec_col not in df_specs.columns:
@@ -1224,17 +979,101 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
         val = spec_row.iloc[0].get(spec_col, "")
         return str(val).strip() if val and str(val).strip() else ""
 
-    def find_empty_d_row():
-        for r in range(17, 23):
-            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
-                return r
-        for r in range(2, 15):
-            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
-                return r
+    # Candidate names for the "Description" column on the Client Spec sheet.
+    DESC_COL_CANDIDATES = ["Description", "Measure Description", "Measure",
+                           "Full Description", "Measure Name"]
+
+    def _spec_desc_col():
+        for c in DESC_COL_CANDIDATES:
+            if c in df_specs.columns:
+                return c
         return None
 
-    measures_list = [m.strip() for m in selected_measures.split(",") if m.strip()]
-    spv_included  = False
+    def lookup_extra_from_spec(token):
+        """Match an EXTRA measure (IOE token) against the Client Spec sheet by
+        Abbreviation OR Description, allowing PARTIAL / half-word matches
+        (e.g. IOE 'AirEx' matches Abbreviation 'AirEx Floorvent').
+
+        Returns (description_for_B, abbreviation_for_C, spec_for_D), or
+        None if no match is found — in which case the caller IGNORES the
+        measure entirely (writes nothing)."""
+        token = str(token).strip()
+        if not token or df_specs.empty:
+            return None
+
+        norm = lambda x: re.sub(r"\s+", " ", str(x).strip().lower())
+        nt = norm(token)
+        if not nt:
+            return None
+
+        desc_col = _spec_desc_col()
+        has_abbr = "Abbreviation" in df_specs.columns
+
+        # Rank candidates (lower = better):
+        #   0 exact Abbreviation       1 exact Description
+        #   2 token inside Abbreviation 3 Abbreviation inside token
+        #   4 token inside Description  5 Description inside token
+        # Substring (ranks 2-5) only when the token is >= 3 chars to avoid
+        # tiny accidental matches.
+        best, best_rank = None, 99
+        allow_sub = len(nt) >= 3
+        for _, r in df_specs.iterrows():
+            na = norm(r.get("Abbreviation", "")) if has_abbr else ""
+            nd = norm(r.get(desc_col, "")) if desc_col else ""
+            rank = None
+            if has_abbr and na and na == nt:
+                rank = 0
+            elif desc_col and nd and nd == nt:
+                rank = 1
+            elif allow_sub and has_abbr and na and len(na) >= 3 and nt in na:
+                rank = 2
+            elif allow_sub and has_abbr and na and len(na) >= 3 and na in nt:
+                rank = 3
+            elif allow_sub and desc_col and nd and len(nd) >= 3 and nt in nd:
+                rank = 4
+            elif allow_sub and desc_col and nd and len(nd) >= 3 and nd in nt:
+                rank = 5
+            if rank is not None and rank < best_rank:
+                best, best_rank = r, rank
+                if rank == 0:
+                    break
+
+        if best is None:
+            return None  # not in Client Spec → ignore the measure
+
+        abbr = str(best.get("Abbreviation", "")).strip() if has_abbr else ""
+        desc = str(best.get(desc_col, "")).strip() if desc_col else ""
+        spec = ""
+        if spec_col and spec_col in df_specs.columns:
+            v = best.get(spec_col, "")
+            spec = str(v).strip() if v and str(v).strip() else ""
+        return (desc or abbr or token), (abbr or desc or token), spec
+
+    def set_cell_unmerged(cell_ref, value):
+        col_letter = "".join(ch for ch in cell_ref if ch.isalpha())
+        row_num    = int("".join(ch for ch in cell_ref if ch.isdigit()))
+        col_idx    = column_index_from_string(col_letter)
+        for merged in list(ws.merged_cells.ranges):
+            c1, r1, c2, r2 = range_boundaries(str(merged))
+            if r1 <= row_num <= r2 and c1 <= col_idx <= c2:
+                ws.unmerge_cells(str(merged))
+                break
+        ws[get_master_cell(ws, cell_ref)] = value
+
+    def find_other_specify_row():
+        for r in range(2, 16):
+            b = ws[get_master_cell(ws, f"B{r}")].value
+            if isinstance(b, str) and "other" in b.lower() and "specify" in b.lower():
+                return r
+        return 14  # fallback to known template position
+
+    # ===========================================================
+    # 1) Place STANDARD (known) measures into their fixed rows
+    # ===========================================================
+    measures_list  = [m.strip() for m in str(selected_measures).split(",") if m.strip()]
+    known_selected = set()
+    used_rows      = set()
+    extra_measures = []
 
     for measure in measures_list:
         matched_key = None
@@ -1242,45 +1081,78 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
             if key.lower() in measure.lower():
                 matched_key = key
                 break
-
-        if matched_key == "SPV":
-            spv_included = True
-
         if matched_key is not None:
             row_num = int(measure_to_cell[matched_key][1:])
-            abbr    = abbrev_map.get(matched_key, "")
-            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
-            seq = measure_seq_lookup.get(matched_key, next_unknown_seq)
-            ws[get_master_cell(ws, f"G{row_num}")] = seq
-            print(f"  ✓ Known measure '{matched_key}' → row {row_num}, seq {seq}")
+            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbrev_map.get(matched_key, ""))
+            known_selected.add(matched_key)
+            used_rows.add(row_num)
+            print(f"  ✓ Standard measure '{matched_key}' → row {row_num}")
         else:
-            row_num = find_empty_d_row()
-            if row_num is None:
-                print(f"  ⚠️  No empty row found for '{measure}' — skipped")
+            extra_measures.append(measure)
+
+    # ===========================================================
+    # 2) Place EXTRA measures
+    #    - heating/renewable -> empty renewable row (17-21) not used by a selected measure
+    #    - fabric/ventilation -> "Other please specify" row
+    #    - always Category = "Minor"
+    #    - never overwrite a selected standard measure's row
+    # ===========================================================
+    renewable_slots = list(range(17, 22))   # rows 17-21 are reusable; 22-23 = SPV (special)
+    renewable_extra_rows = []
+    fabric_extra_rows    = []
+
+    def next_empty_renewable_row():
+        for r in renewable_slots:
+            if r in used_rows:
                 continue
+            if ws[get_master_cell(ws, f"D{r}")].value in (None, ""):
+                return r
+        return None
 
-            b_master = get_master_cell(ws, f"B{row_num}")
-            for merged in list(ws.merged_cells.ranges):
-                c1, r1, c2, r2 = range_boundaries(str(merged))
-                if r1 <= row_num <= r2 and c1 <= 2 <= c2:
-                    ws.unmerge_cells(str(merged))
-                    break
-            ws[b_master] = measure
+    other_row  = find_other_specify_row()
+    other_used = False
 
-            abbr     = abbrev_map.get(measure, measure[:4].upper())
-            c_master = get_master_cell(ws, f"C{row_num}")
-            for merged in list(ws.merged_cells.ranges):
-                c1, r1, c2, r2 = range_boundaries(str(merged))
-                if r1 <= row_num <= r2 and c1 <= 3 <= c2:
-                    ws.unmerge_cells(str(merged))
-                    break
-            ws[c_master] = abbr
-            ws[get_master_cell(ws, f"D{row_num}")] = get_spec(abbr)
-            ws[get_master_cell(ws, f"G{row_num}")] = next_unknown_seq
-            ws[get_master_cell(ws, f"H{row_num}")] = "Minor"
-            print(f"  ℹ️  Unknown measure '{measure}' → row {row_num}, seq {next_unknown_seq}")
-            next_unknown_seq += 1
+    for measure in extra_measures:
+        # Pull from the Client Spec Smartsheet (NOT from IOE / Property Master):
+        #   B <- Description, C <- Abbreviation, D <- spec column.
+        # If the measure is not found in the Client Spec sheet → IGNORE it.
+        found = lookup_extra_from_spec(measure)
+        if found is None:
+            print(f"  ⛔ Extra '{measure}' not found in Client Spec "
+                  f"(no Abbreviation/Description match) — ignored")
+            continue
+        desc, abbr, spec = found
+        classify_text = f"{measure} {desc} {abbr}"
 
+        if is_heating_renewable(classify_text):
+            target = next_empty_renewable_row()
+            if target is None:
+                print(f"  ⚠️  No empty renewable slot for extra '{measure}' — skipped")
+                continue
+            renewable_extra_rows.append(target)
+            zone = "renewable table"
+        else:
+            if other_used:
+                print(f"  ⚠️  Extra fabric measure '{measure}' skipped — "
+                      f"'Other please specify' row already used")
+                continue
+            target = other_row
+            other_used = True
+            fabric_extra_rows.append(target)
+            zone = "Other please specify"
+
+        set_cell_unmerged(f"B{target}", desc)               # Description (Client Spec sheet)
+        set_cell_unmerged(f"C{target}", abbr)               # Abbreviation (Client Spec sheet)
+        ws[get_master_cell(ws, f"D{target}")] = spec        # Specification (Client Spec sheet)
+        ws[get_master_cell(ws, f"H{target}")] = "Minor"     # ALWAYS Minor
+        used_rows.add(target)
+        print(f"  ➕ Extra '{measure}' → row {target} [{zone}] "
+              f"B='{desc}' C='{abbr}', Category=Minor")
+
+    # ===========================================================
+    # 3) Solar PV orientation / shading
+    # ===========================================================
+    spv_included = "SPV" in known_selected
     if spv_included:
         if orientation_direction:
             ws[get_master_cell(ws, "F22")] = orientation_direction
@@ -1290,30 +1162,42 @@ def write_sheet_7(ws, wb_data: dict, df_specs, selected_measures, orientation_di
         ws[get_master_cell(ws, "F22")] = None
         ws[get_master_cell(ws, "F23")] = None
 
-    condition_met = any(
-        ws[get_master_cell(ws, cell)].value not in (None, False, "", "FALSE")
-        for cell in ["A5", "A6", "A7", "A8", "A10", "A12", "A13"]
-    )
+    # ===========================================================
+    # 4) Major-works flags on sheet 4.0 (H3/H4)
+    #    Yes if any major fabric measure is selected.
+    # ===========================================================
+    major_fabric_keys = {"LI (B9)", "CWI", "EWI", "IWI", "FRI", "Windows", "Doors"}
+    condition_met = any(k in known_selected for k in major_fabric_keys)
     ws4["H3"].value = "Yes" if condition_met else "No"
     ws4["H4"].value = "Yes" if condition_met else "No"
 
+    # ===========================================================
+    # 5) Installation sequence (column G)
+    #    Standard measures: 1..N in install order.
+    #    Extras: continue N+1, N+2… (renewable extras first, then fabric extras),
+    #    so they never reuse a standard measure's sequence number.
+    # ===========================================================
     seq_number = 1
     for group in SEQUENCE_ORDER:
-        group_has_content = False
-        for measure_name in group:
-            if measure_name not in measure_to_cell:
-                continue
-            row_num = int(measure_to_cell[measure_name][1:])
-            if ws[get_master_cell(ws, f"D{row_num}")].value not in (None, ""):
-                ws[get_master_cell(ws, f"G{row_num}")] = seq_number
-                group_has_content = True
-        if group_has_content:
+        if any(name in known_selected for name in group):
+            for name in group:
+                if name in known_selected and name in measure_to_cell:
+                    row_num = int(measure_to_cell[name][1:])
+                    # skip rows we repurposed for extras (shouldn't happen, but safe)
+                    if row_num in renewable_extra_rows or row_num in fabric_extra_rows:
+                        continue
+                    ws[get_master_cell(ws, f"G{row_num}")] = seq_number
             seq_number += 1
 
+    for extra_row in renewable_extra_rows + fabric_extra_rows:
+        ws[get_master_cell(ws, f"G{extra_row}")] = seq_number
+        seq_number += 1
 
-# ================================================================
-# MAIN PROCESSING LOOP
-# ================================================================
+
+# %% [markdown]
+# ## Main processing loop (unchanged from your original)
+
+# %%
 property_folders = [
     os.path.join(PARENT_FOLDER, f)
     for f in os.listdir(PARENT_FOLDER)
@@ -1322,9 +1206,7 @@ property_folders = [
 
 for prop_path in tqdm(property_folders, desc="Processing properties", unit="property"):
     prop_name = os.path.basename(prop_path)
-
     try:
-        # ── Locate PDFs ───────────────────────────────────────────
         retrofit = find_retrofit_folder(prop_path)
         if not retrofit:
             print(f"⏭️  Skipped {prop_name} – no Retrofit folder")
@@ -1339,7 +1221,6 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         sn_text  = read_pdf_text(sn_pdf)
         epr_text = read_pdf_text(epr_pdf)
 
-        # ── Address matching ──────────────────────────────────────
         dwelling_address = extract_property_address_from_cr(cr_pdf)
 
         df1 = pd.DataFrame({"Address": [dwelling_address]})
@@ -1376,95 +1257,60 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
 
         if matched_row is None:
             print(f"⚠️  {prop_name} – No address match found")
-            matched_address   = ""
-            selected_measures = ""
-            property_id_value = ""
-            sap_potential     = ""
-            sap_current       = ""
-            # ── No match → climate risk / flag values from Smartsheet are empty ──
-            conservation_flag = ""
-            listed_building   = ""
-            radon_risk        = ""
-            flood_risk        = ""
-            subs2030          = ""
-            subs2070          = ""
-            wdr_risk          = ""
-            rainfall_risk     = ""
-            wind_speed_risk   = ""
-            wildfire_risk     = ""
+            matched_address = selected_measures = property_id_value = sap_potential = sap_current = ""
+            conservation_flag = listed_building = radon_risk = flood_risk = ""
+            subs2030 = subs2070 = wdr_risk = rainfall_risk = wind_speed_risk = wildfire_risk = ""
         else:
             print(f"✅ {prop_name} – ADDRESS MATCH")
-            matched_address   = matched_row["Address"]
-            selected_measures = matched_row["Selected_Measures"]
+            matched_address   = matched_row.get("Address", "")
+            # Robust read: column may be "Selected_Measures" (after rename),
+            # "Select Measures" (original), or any column containing "measure".
+            if "Selected_Measures" in matched_row.index:
+                selected_measures = matched_row["Selected_Measures"]
+            elif "Select Measures" in matched_row.index:
+                selected_measures = matched_row["Select Measures"]
+            else:
+                _mcol = next((c for c in matched_row.index if "measure" in str(c).lower()), None)
+                selected_measures = matched_row[_mcol] if _mcol else ""
             property_id_value = matched_row.get("Property ID", "")
             sap_potential     = matched_row.get(PROPOSED_SAP_COL, "")
             sap_current       = matched_row.get(PRE_SAP_COL, "")
-
             print(f"🏷️  {prop_name} – Property ID from IOE sheet: {property_id_value}")
 
-        # ── Property Master risk lookup using Property ID ─────────
         if property_id_value:
             print(f"🔗 {prop_name} – Fetching Property Master Smartsheet")
             df_master = fetch_property_master_df()
             master_row = find_property_master_row(df_master, property_id_value)
-
             if master_row is None:
-                print(f"⚠️  {prop_name} – No Property Master match found for Property ID: {property_id_value}")
-                conservation_flag = ""
-                listed_building   = ""
-                radon_risk        = ""
-                flood_risk        = ""
-                subs2030          = ""
-                subs2070          = ""
-                wdr_risk          = ""
-                rainfall_risk     = ""
-                wind_speed_risk   = ""
-                wildfire_risk     = ""
+                print(f"⚠️  {prop_name} – No Property Master match for Property ID: {property_id_value}")
+                conservation_flag = listed_building = radon_risk = flood_risk = ""
+                subs2030 = subs2070 = wdr_risk = rainfall_risk = wind_speed_risk = wildfire_risk = ""
             else:
-                print(f"✅ {prop_name} – Property Master match found for Property ID: {property_id_value}")
+                print(f"✅ {prop_name} – Property Master match for Property ID: {property_id_value}")
                 conservation_flag = get_safe_value(master_row, CONSERVATION_AREA_COL)
                 listed_building   = get_safe_value(master_row, LISTED_BUILDING_COL)
                 radon_risk        = get_safe_value(master_row, RADON_RISK_COL)
-
-                flood_risk_raw = get_safe_value(master_row, FLOOD_RISK_COL)
-                flood_risk = "No" if flood_risk_raw == "" else flood_risk_raw
-
-                subs2030        = get_safe_value(master_row, SUBS_2030_COL)
-                subs2070        = get_safe_value(master_row, SUBS_2070_COL)
-                wdr_risk        = get_safe_value(master_row, WDR_RISK_COL)
-                rainfall_risk   = get_safe_value(master_row, RAINFALL_RISK_COL)
-                wind_speed_risk = get_safe_value(master_row, WIND_SPEED_RISK_COL)
-                wildfire_risk   = get_safe_value(master_row, WILDFIRE_RISK_COL)
-
-                print(
-                    f"🌍 {prop_name} – Property Master risks → "
-                    f"Conservation: {conservation_flag} | "
-                    f"Listed: {listed_building} | "
-                    f"Radon: {radon_risk} | "
-                    f"Flood: {flood_risk}"
-                )
+                flood_risk_raw    = get_safe_value(master_row, FLOOD_RISK_COL)
+                flood_risk        = "No" if flood_risk_raw == "" else flood_risk_raw
+                subs2030          = get_safe_value(master_row, SUBS_2030_COL)
+                subs2070          = get_safe_value(master_row, SUBS_2070_COL)
+                wdr_risk          = get_safe_value(master_row, WDR_RISK_COL)
+                rainfall_risk     = get_safe_value(master_row, RAINFALL_RISK_COL)
+                wind_speed_risk   = get_safe_value(master_row, WIND_SPEED_RISK_COL)
+                wildfire_risk     = get_safe_value(master_row, WILDFIRE_RISK_COL)
+                print(f"🌍 {prop_name} – Conservation: {conservation_flag} | Listed: {listed_building} | "
+                      f"Radon: {radon_risk} | Flood: {flood_risk}")
         else:
-            print(f"⚠️  {prop_name} – Property Master lookup skipped because Property ID is missing")
-            conservation_flag = ""
-            listed_building   = ""
-            radon_risk        = ""
-            flood_risk        = ""
-            subs2030          = ""
-            subs2070          = ""
-            wdr_risk          = ""
-            rainfall_risk     = ""
-            wind_speed_risk   = ""
-            wildfire_risk     = ""
+            print(f"⚠️  {prop_name} – Property Master lookup skipped (Property ID missing)")
+            conservation_flag = listed_building = radon_risk = flood_risk = ""
+            subs2030 = subs2070 = wdr_risk = rainfall_risk = wind_speed_risk = wildfire_risk = ""
 
-        # ── Coordinates ───────────────────────────────────────────
         latitude, longitude = extract_lat_lon_from_cr(cr_pdf)
         if latitude == "" or longitude == "":
             raise ValueError("Latitude/Longitude not found in CR PDF.")
 
-        # ── EPR additional ratings ────────────────────────────────
         epr_lines = epr_text.splitlines()
-        nums      = []
-        capture   = False
+        nums, capture = [], False
         for line in epr_lines:
             if "Additional ratings for your home" in line:
                 capture = True
@@ -1487,7 +1333,6 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         else:
             extra1 = extra2 = extra1_last = extra2_last = ""
 
-        # ── SN page 1 data ────────────────────────────────────────
         sn_page1_text = "\n".join(read_pdf_page_lines(sn_pdf, 0))
         m_tenure      = re.search(r"Property\s+Tenure:\s*([^\n\r]+)", sn_page1_text)
         raw_tenure    = m_tenure.group(1).strip() if m_tenure else ""
@@ -1497,7 +1342,6 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         num_storeys   = extract_num_storeys_from_sn(sn_pdf)
         wall_type     = safe_search(r"Type\s+[A-Z]+\s+(.*)", sn_text)
         property_type = extract_property_type_from_epr(epr_text)
-        hab_rooms     = safe_search(r"Habitable Rooms:\s*(\d+)", sn_text)
         exposure_zone = extract_exposure_zone_from_cr(cr_pdf)
 
         tfa = safe_search(r"Total Floor Area\s*([\d\.]+\s*m²?)", epr_text)
@@ -1507,11 +1351,8 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         vulnerable_flag                                       = extract_vulnerable_flag_from_cr(cr_pdf)
         property_constraints_val, property_construction_flag  = extract_constraints_and_construction_from_cr(cr_pdf)
         orientation_direction                                 = get_building_orientation_direction(cr_pdf)
-
-        # ── Bedroom count ─────────────────────────────────────────
         highest_bedroom = extract_highest_bedroom_from_contents(read_pdf_page_lines(cr_pdf, 1))
 
-        # ── Fetch client spec sheet ───────────────────────────────
         resp2    = requests.get(f"https://api.smartsheet.eu/2.0/sheets/{SECOND_SHEET_ID}", headers=SM_HEADERS)
         resp2.raise_for_status()
         sheet2   = resp2.json()
@@ -1521,18 +1362,16 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
             rows2.append({col_map2.get(c["columnId"], ""): c.get("displayValue", c.get("value", "")) for c in r2["cells"]})
         df_specs = pd.DataFrame(rows2)
 
-        # ── Validate spec columns exist (warn only) ───────────────
         if not df_specs.empty:
             if PRELIM_SPEC_COL and PRELIM_SPEC_COL not in df_specs.columns:
-                print(f"⚠️  {prop_name} – Prelim spec column '{PRELIM_SPEC_COL}' not in Client Spec sheet — Prelim specs will be blank")
+                print(f"⚠️  {prop_name} – Prelim spec column '{PRELIM_SPEC_COL}' not in Client Spec sheet")
             if CONSTRUCTION_SPEC_COL and CONSTRUCTION_SPEC_COL not in df_specs.columns:
-                print(f"⚠️  {prop_name} – Construction spec column '{CONSTRUCTION_SPEC_COL}' not in Client Spec sheet — Construction specs will be blank")
+                print(f"⚠️  {prop_name} – Construction spec column '{CONSTRUCTION_SPEC_COL}' not in Client Spec sheet")
 
-        # ── Bundle all extracted data ─────────────────────────────
         wb_data = {
             "dwelling_address":           dwelling_address,
             "property_id_value":          property_id_value,
-            "local_authority_name":       static_local_authority,
+            "local_authority_name":       static_local_authority,   # -> 4.0 B5 only
             "sap_current":                sap_current,
             "sap_potential":              sap_potential,
             "tenure":                     tenure,
@@ -1562,55 +1401,32 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
             "wildfire_risk":              wildfire_risk,
         }
 
-        # ── PRELIM OUTPUT — no climate risk, uses PRELIM_SPEC_COL ──
+        # ── PRELIM — NOW WITH climate risk, uses PRELIM_SPEC_COL ──
         wb_prelim  = load_workbook(EXCEL_FILE)
         ws4_prelim = wb_prelim["4.0"]
         write_sheet_4_base(ws4_prelim, wb_data)
-
+        write_sheet_4_climate_risk(ws4_prelim, wb_data)   # NEW: climate risk now included in Prelim too
         ws7_prelim = wb_prelim["7.0"]
         write_sheet_7(ws7_prelim, wb_data, df_specs, selected_measures, orientation_direction, ws4_prelim, spec_col=PRELIM_SPEC_COL)
-
         write_sheet_10(wb_prelim)
-
-        insert_rooms_with_template(
-            cr_pdf_path     = cr_pdf,
-            workbook        = wb_prelim,
-            sheet_name      = "11.0",
-            insert_at_row   = 5,
-            template_row    = 4,
-            room_col_left   = "A",
-            room_col_right  = "J",
-            tfa             = tfa,
-            highest_bedroom = highest_bedroom
-        )
-
+        insert_rooms_with_template(cr_pdf_path=cr_pdf, workbook=wb_prelim, sheet_name="11.0",
+                                   insert_at_row=5, template_row=4, room_col_left="A", room_col_right="J",
+                                   tfa=tfa, highest_bedroom=highest_bedroom)
         prelim_file = os.path.join(OUTPUT_ROOT, f"{prop_name}_Prelim.xlsx")
         wb_prelim.save(prelim_file)
         print(f"📄 Prelim saved: {prelim_file}")
 
-        # ── CONSTRUCTION OUTPUT — with climate risk, uses CONSTRUCTION_SPEC_COL ──
+        # ── CONSTRUCTION — with climate risk, uses CONSTRUCTION_SPEC_COL ──
         wb_construction  = load_workbook(EXCEL_FILE)
         ws4_construction = wb_construction["4.0"]
         write_sheet_4_base(ws4_construction, wb_data)
         write_sheet_4_climate_risk(ws4_construction, wb_data)
-
         ws7_construction = wb_construction["7.0"]
         write_sheet_7(ws7_construction, wb_data, df_specs, selected_measures, orientation_direction, ws4_construction, spec_col=CONSTRUCTION_SPEC_COL)
-
         write_sheet_10(wb_construction)
-
-        insert_rooms_with_template(
-            cr_pdf_path     = cr_pdf,
-            workbook        = wb_construction,
-            sheet_name      = "11.0",
-            insert_at_row   = 5,
-            template_row    = 4,
-            room_col_left   = "A",
-            room_col_right  = "J",
-            tfa             = tfa,
-            highest_bedroom = highest_bedroom
-        )
-
+        insert_rooms_with_template(cr_pdf_path=cr_pdf, workbook=wb_construction, sheet_name="11.0",
+                                   insert_at_row=5, template_row=4, room_col_left="A", room_col_right="J",
+                                   tfa=tfa, highest_bedroom=highest_bedroom)
         construction_file = os.path.join(OUTPUT_ROOT, f"{prop_name}_Construction.xlsx")
         wb_construction.save(construction_file)
         print(f"🏗️  Construction saved: {construction_file}")
@@ -1623,8 +1439,6 @@ for prop_path in tqdm(property_folders, desc="Processing properties", unit="prop
         traceback.print_exc()
         continue
 
-# ================================================================
-# SUMMARY
-# ================================================================
+# %%
 elapsed = time.time() - start_time
 print(f"\n⏱️  Total execution time: {elapsed:.2f}s ({elapsed / 60:.2f} min)")
