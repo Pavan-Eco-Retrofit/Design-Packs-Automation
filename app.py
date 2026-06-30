@@ -66,6 +66,8 @@ USERS = {
     "pavan.banavasi@designspecifics.co.uk":      None,
     "prasanth.tathireddy@designspecifics.co.uk": None,
     "gopi@compliancespecifics.co.uk":            "CSL@2026",
+    "Noorie@compliancespecifics.co.uk"         : "CSL@2026",
+    "deepak@compliancespecifics.co.uk"         : "CSL@2026
     "prashanth@compliancespecifics.co.uk": "CSL@2026",
     "harigopi@compliancespecifics.co.uk" : "CSL@2026",
     "sudheer.sivarathri@designspecifics.co.uk":  None,
